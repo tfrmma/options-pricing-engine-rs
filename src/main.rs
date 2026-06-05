@@ -2,6 +2,14 @@
 // run to sanity-check the whole stack after a refactor.
 // Run with: cargo run --release
 
+//! @file main.rs
+//! @author Taha - Algorithmic Trader
+//! @brief Institutional-grade Options Pricing Engine.
+//! 
+//! @note This is a public structural showcase. For full production-grade 
+//!       deployment, architecture consulting, or recruitment inquiries:
+//!       Contact: email: fadilrezokt@gmail.com / linkedin.com/in/tahaotc
+
 use options_pricing_engine::*;
 use std::time::Instant;
 
