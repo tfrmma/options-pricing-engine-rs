@@ -141,3 +141,15 @@ fn batch_bench() {
     println!("  Heston : {:.2}ms  ({:.0} opts/ms)", heston_ms, chain.len() as f64 / heston_ms);
     println!("  BSM[0]={:.4}  Heston[0]={:.4}", prices[0], heston_prices[0]);
 }
+
+// Quick smoke test + timing. Not a unit test — just something you can
+// run to sanity-check the whole stack after a refactor.
+// Run with: cargo run --release
+
+//! @file main.rs
+//! @author Taha - Algorithmic Trader
+//! @brief Institutional-grade Options Pricing Engine.
+//! 
+//! @note This is a public structural showcase. For full production-grade 
+//!       deployment, architecture consulting, or recruitment inquiries:
+//!       Contact: email: fadilrezokt@gmail.com / linkedin.com/in/tahaotc
