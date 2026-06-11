@@ -2,12 +2,11 @@
 // CF for Bates = Heston CF * jump CF. that's the whole trick.
 // keep them separate — bolting jumps onto Heston post-integration doesn't work.
 //
-// yes, stable_cf is copy-pasted from heston.rs. I know.
-// TODO: pull shared CF into cf_core.rs once we add more jump models.
+// stable_cf and gk_integrate live in heston.rs — imported directly below.
 
 use num_complex::Complex64;
 use crate::types::{BatesParams, OptionType};
-use crate::heston::heston_price;
+use crate::heston::{heston_price, stable_cf, gk_integrate};
 
 pub fn bates_price(
     spot: f64, strike: f64, expiry: f64,
@@ -32,7 +31,7 @@ fn bates_call(s: f64, k: f64, t: f64, r: f64, q: f64, bp: &BatesParams) -> f64 {
 
 fn bates_integrand(u: f64, x: f64, t: f64, r: f64, bp: &BatesParams, is_p1: bool) -> f64 {
     let phi = if is_p1 { Complex64::new(u, -1.0) } else { Complex64::new(u, 0.0) };
-    let cf  = heston_cf(phi, t, r, &bp.heston) * jump_cf(phi, t, bp);
+    let cf  = stable_cf(phi, t, r, &bp.heston) * jump_cf(phi, t, bp);
     let num = Complex64::new(0.0, -u * x).exp() * cf;
     (num / Complex64::new(0.0, u)).re
 }
@@ -45,47 +44,6 @@ fn jump_cf(phi: Complex64, t: f64, bp: &BatesParams) -> Complex64 {
     let comp = (mu_j + 0.5*sigma_j*sigma_j).exp() - 1.0;
     let jump = (phi*i*mu_j - 0.5*phi*phi*sigma_j*sigma_j).exp();
     (lambda * t * (jump - 1.0 - i*phi*comp)).exp()
-}
-
-// copy of Albrecher stable CF — see heston.rs for the why
-fn heston_cf(phi: Complex64, t: f64, r: f64, p: &crate::types::HestonParams) -> Complex64 {
-    let i   = Complex64::i();
-    let &crate::types::HestonParams { v0, kappa, theta, sigma, rho } = p;
-    let xi  = kappa - rho*sigma*phi*i;
-    let d   = (xi*xi + sigma*sigma*phi*(phi + i)).sqrt();
-    let g   = (xi - d) / (xi + d);
-    let edt = (-d*t).exp();
-    let a   = (g*edt - 1.0) / (g - 1.0);
-    let c   = (kappa*theta/(sigma*sigma)) * ((xi - d)*t - 2.0*a.ln());
-    let dd  = v0*(xi - d)*(1.0 - edt) / (sigma*sigma*(1.0 - g*edt));
-    (r*phi*i*t + c + dd).exp()
-}
-
-fn gk_integrate<F: Fn(f64) -> f64>(f: F) -> f64 {
-    const NODES: [f64; 15] = [
-        0.0,
-        0.2077849550078985, -0.2077849550078985,
-        0.4058451513773972, -0.4058451513773972,
-        0.5860872354676911, -0.5860872354676911,
-        0.7415311855993945, -0.7415311855993945,
-        0.8648644233597691, -0.8648644233597691,
-        0.9491079123427585, -0.9491079123427585,
-        0.9914553711208126, -0.9914553711208126,
-    ];
-    const WEIGHTS: [f64; 15] = [
-        0.2094821410847278,
-        0.2044329400752989, 0.2044329400752989,
-        0.1903505780647854, 0.1903505780647854,
-        0.1690047266392679, 0.1690047266392679,
-        0.1406532597155259, 0.1406532597155259,
-        0.1047900103222502, 0.1047900103222502,
-        0.0630920926299786, 0.0630920926299786,
-        0.0229353220105292, 0.0229353220105292,
-    ];
-    let mid = 100.0_f64; // upper = 200, mid = 100
-    NODES.iter().zip(WEIGHTS.iter())
-        .map(|(&n, &w)| { let u = mid + mid*n; if u < 1e-12 { 0.0 } else { w*f(u) } })
-        .sum::<f64>() * mid
 }
 
 #[cfg(test)]
