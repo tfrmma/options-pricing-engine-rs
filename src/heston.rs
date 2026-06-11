@@ -68,7 +68,7 @@ fn cf_integrand(u: f64, x: f64, t: f64, r: f64, p: &HestonParams, is_p1: bool) -
 
 // Albrecher stable form. the g/(g-1) ratio avoids the log branch-cut issue
 // that makes the original Heston formula blow up for longer maturities.
-fn stable_cf(phi: Complex64, t: f64, r: f64, p: &HestonParams) -> Complex64 {
+pub(crate) fn stable_cf(phi: Complex64, t: f64, r: f64, p: &HestonParams) -> Complex64 {
     let i = Complex64::i();
     let &HestonParams { v0, kappa, theta, sigma, rho } = p;
 
@@ -84,7 +84,7 @@ fn stable_cf(phi: Complex64, t: f64, r: f64, p: &HestonParams) -> Complex64 {
     (r * phi * i * t + c + dd).exp()
 }
 
-fn gk_integrate<F: Fn(f64) -> f64>(f: F) -> f64 {
+pub(crate) fn gk_integrate<F: Fn(f64) -> f64>(f: F) -> f64 {
     let upper = 200.0;
     let mid   = upper / 2.0;
     GK_NODES.iter().zip(GK_WEIGHTS.iter())
