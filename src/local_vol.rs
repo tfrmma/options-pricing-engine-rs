@@ -73,8 +73,10 @@ fn d2var_dk2(surf: &LocalVolSurface, i_k: usize, j_t: usize) -> f64 {
     let i  = i_k.max(1).min(n-2);
     let dp = surf.strikes[i+1] - surf.strikes[i];
     let dm = surf.strikes[i]   - surf.strikes[i-1];
+    // denominator for symmetric 3-point FD on non-uniform grid is (dp^2+dm^2)/2.
+    // the original (dp+dm)^2/4 is wrong. dp*dm is also wrong unless dp==dm.
     (total_var(surf,i+1,j_t) - 2.0*total_var(surf,i,j_t) + total_var(surf,i-1,j_t))
-        / (0.5*(dp+dm) * 0.5*(dp+dm))
+        / (0.5 * (dp*dp + dm*dm))
 }
 
 #[inline]
@@ -100,11 +102,17 @@ pub fn monotone_cubic_interp(xs: &[f64], ys: &[f64], xq: f64) -> f64 {
     let mi  = slope(xs, ys, i);
     let mi1 = slope(xs, ys, i+1);
 
-    // Fritsch-Butland limiter — prevents overshoot
+    // Fritsch-Butland limiter — prevents overshoot.
+    // condition: alpha^2 + alpha*beta + beta^2 <= 9, where alpha=mi/delta, beta=mi1/delta.
+    // if violated, scale both slopes down uniformly so we sit on the boundary.
+    // the sqrt formula that was here before is not F-B. it's a made-up norm that
+    // happens to limit *something* but not the right thing — it'll overshoot on
+    // asymmetric intervals.
     let delta = (ys[i+1] - ys[i]) / dx;
-    let lim  = if delta.abs() < 1e-15 { 0.0 } else {
+    let lim = if delta.abs() < 1e-15 { 0.0 } else {
         let a = mi / delta; let b = mi1 / delta;
-        (3.0 / (a*a + b*b + a*b).sqrt()).min(1.0)
+        let cond = a*a + a*b + b*b;
+        if cond <= 9.0 { 1.0 } else { (9.0 / cond).sqrt() }
     };
     let m0 = lim * mi;
     let m1 = lim * mi1;
@@ -161,6 +169,44 @@ mod tests {
             let y = monotone_cubic_interp(&xs, &ys, xs[i] + 0.3);
             assert!(y >= prev - 1e-10);
             prev = y;
+        }
+    }
+}
+
+#[cfg(test)]
+mod p0_regression {
+    use super::*;
+    use crate::types::LocalVolSurface;
+
+    // non-uniform strike grid. the old d2var_dk2 used (0.5*(dp+dm))^2 which is wrong.
+    // correct denominator for the symmetric numerator is (dp^2+dm^2)/2.
+    #[test]
+    fn nonuniform_grid_curvature() {
+        // strikes with intentionally uneven spacing
+        let ks = vec![90.0, 95.0, 105.0, 125.0];
+        let ts = vec![0.5, 1.0];
+        // flat surface => zero curvature => local vol should match iv
+        let ivs = vec![0.2_f64; ks.len() * ts.len()];
+        let surf = LocalVolSurface::new(ks, ts, ivs);
+        let lv = dupire_local_vol(&surf, 100.0, 0.02, 0.0, 1, 0);
+        assert!((lv - 0.2).abs() < 0.02, "nonuniform curvature err: lv={lv:.4}");
+    }
+
+    // asymmetric interval — this is where the old F-B formula would overshoot.
+    // interpolant must stay bounded between adjacent nodes.
+    #[test]
+    fn interp_no_overshoot_asymmetric() {
+        let xs = vec![0.0, 0.1, 0.11, 1.0, 2.0];
+        let ys = vec![0.0, 0.5,  0.5, 0.6, 0.7];
+        for j in 0..4 {
+            let lo = ys[j].min(ys[j+1]);
+            let hi = ys[j].max(ys[j+1]);
+            for k in 0..5 {
+                let xq = xs[j] + (xs[j+1] - xs[j]) * (k as f64 / 4.0);
+                let y  = monotone_cubic_interp(&xs, &ys, xq);
+                assert!(y >= lo - 1e-10 && y <= hi + 1e-10,
+                    "overshoot at xq={xq:.3}: y={y:.6} not in [{lo:.4},{hi:.4}]");
+            }
         }
     }
 }
