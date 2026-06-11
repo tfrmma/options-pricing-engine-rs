@@ -14,7 +14,7 @@ use num_complex::Complex64;
 use crate::types::{HestonParams, OptionType, PricingResult};
 
 // standard GK-15 nodes/weights on [-1,1]
-const GK_NODES: [f64; 15] = [
+pub const GK_NODES: [f64; 15] = [
     0.0,
     0.2077849550078985, -0.2077849550078985,
     0.4058451513773972, -0.4058451513773972,
@@ -25,7 +25,7 @@ const GK_NODES: [f64; 15] = [
     0.9914553711208126, -0.9914553711208126,
 ];
 
-const GK_WEIGHTS: [f64; 15] = [
+pub const GK_WEIGHTS: [f64; 15] = [
     0.2094821410847278,
     0.2044329400752989, 0.2044329400752989,
     0.1903505780647854, 0.1903505780647854,
