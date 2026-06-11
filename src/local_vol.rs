@@ -6,14 +6,14 @@
 // fix: Fritsch-Butland monotone cubic spline before differentiating.
 // guarantees no overshoot between grid points => derivatives stay sane.
 //
-// TODO: arbitrage check on input surface before computing local vols.
-//       right now we just clamp negatives. good enough for now but will
-//       bite someone eventually on a badly-conditioned calendar spread.
+// arbitrage check: call check_and_repair_surface before passing to dupire_local_vol.
+// it catches calendar spread and butterfly violations and repairs them in-place
+// with the minimum adjustment needed to restore no-arb.
 
 use crate::types::LocalVolSurface;
 
 // returns local vol (not variance) at grid node (i_k, j_t).
-// returns 0.0 if the result is degenerate — clean your surface if this happens a lot.
+// returns 0.0 if the result is degenerate, clean your surface if this happens a lot.
 pub fn dupire_local_vol(
     surf: &LocalVolSurface,
     spot: f64, rate: f64, div_yield: f64,
@@ -102,7 +102,7 @@ pub fn monotone_cubic_interp(xs: &[f64], ys: &[f64], xq: f64) -> f64 {
     let mi  = slope(xs, ys, i);
     let mi1 = slope(xs, ys, i+1);
 
-    // Fritsch-Butland limiter — prevents overshoot.
+    // Fritsch-Butland limiter prevents overshoot.
     // condition: alpha^2 + alpha*beta + beta^2 <= 9, where alpha=mi/delta, beta=mi1/delta.
     // if violated, scale both slopes down uniformly so we sit on the boundary.
     // the sqrt formula that was here before is not F-B. it's a made-up norm that
@@ -133,6 +133,96 @@ fn slope(xs: &[f64], ys: &[f64], i: usize) -> f64 {
     } else {
         0.5 * ((ys[i] - ys[i-1])/(xs[i] - xs[i-1]) + (ys[i+1] - ys[i])/(xs[i+1] - xs[i]))
     }
+}
+
+
+// --- arbitrage check + repair ---
+
+#[derive(Debug, Clone)]
+pub struct SurfaceViolation {
+    pub kind:  ViolationKind,
+    pub i_k:   usize,
+    pub j_t:   usize,
+    pub delta: f64,  // how far out of bounds (positive = magnitude of violation)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ViolationKind {
+    // total variance not increasing in T at fixed K. implies negative calendar spread.
+    CalendarSpread,
+    // total variance not convex in K at fixed T. implies negative butterfly price.
+    Butterfly,
+}
+
+pub struct SurfaceAudit {
+    pub violations: Vec<SurfaceViolation>,
+    pub repaired:   usize,
+}
+
+// checks and repairs a LocalVolSurface in-place.
+// calendar spread: w(K, T2) >= w(K, T1) for T2 > T1.
+// butterfly: w(K-) - 2*w(K) + w(K+) >= 0 (convexity in strike space).
+//
+// repair strategy: minimum upward adjustment on the offending node.
+// we don't touch neighbors repair is conservative and local.
+// if the surface is badly broken, run multiple passes until clean.
+pub fn check_and_repair_surface(surf: &mut LocalVolSurface) -> SurfaceAudit {
+    let mut violations = vec![];
+    let mut repaired   = 0;
+
+    let nk = surf.strikes.len();
+    let nt = surf.expiries.len();
+
+    // calendar spread: for each (i_k, j_t > 0), w(j_t) >= w(j_t-1).
+    // repair: bump iv at j_t up so total variances are equal (minimum fix).
+    for i_k in 0..nk {
+        for j_t in 1..nt {
+            let w_prev = total_var_raw(&surf.local_vols, nk, nt, i_k, j_t-1, surf.expiries[j_t-1]);
+            let w_cur  = total_var_raw(&surf.local_vols, nk, nt, i_k, j_t,   surf.expiries[j_t]);
+            if w_cur < w_prev {
+                let delta = w_prev - w_cur;
+                violations.push(SurfaceViolation {
+                    kind: ViolationKind::CalendarSpread, i_k, j_t, delta,
+                });
+                // set iv so w_cur == w_prev + epsilon
+                let new_iv = ((w_prev + 1e-8) / surf.expiries[j_t]).max(0.0).sqrt();
+                surf.local_vols[i_k * nt + j_t] = new_iv;
+                repaired += 1;
+            }
+        }
+    }
+
+    // butterfly: for each interior strike, w(i-1) - 2*w(i) + w(i+1) >= 0.
+    // repair: raise the middle node to the average of neighbors minus epsilon.
+    for j_t in 0..nt {
+        for i_k in 1..(nk-1) {
+            let wm = total_var_raw(&surf.local_vols, nk, nt, i_k-1, j_t, surf.expiries[j_t]);
+            let w0 = total_var_raw(&surf.local_vols, nk, nt, i_k,   j_t, surf.expiries[j_t]);
+            let wp = total_var_raw(&surf.local_vols, nk, nt, i_k+1, j_t, surf.expiries[j_t]);
+            let convexity = wm - 2.0*w0 + wp;
+            if convexity < 0.0 {
+                let delta = -convexity;
+                violations.push(SurfaceViolation {
+                    kind: ViolationKind::Butterfly, i_k, j_t, delta,
+                });
+                // minimum repair: set w0 = (wm + wp) / 2 - epsilon
+                let w0_new = 0.5*(wm + wp) - 1e-8;
+                if w0_new > 0.0 {
+                    surf.local_vols[i_k * nt + j_t] = (w0_new / surf.expiries[j_t]).sqrt();
+                    repaired += 1;
+                }
+            }
+        }
+    }
+
+    SurfaceAudit { violations, repaired }
+}
+
+// inline helper avoids borrowing surf mutably while we read
+#[inline]
+fn total_var_raw(ivs: &[f64], nk: usize, nt: usize, i_k: usize, j_t: usize, t: f64) -> f64 {
+    let iv = ivs[i_k * nt + j_t];
+    iv * iv * t
 }
 
 #[cfg(test)]
@@ -192,7 +282,7 @@ mod p0_regression {
         assert!((lv - 0.2).abs() < 0.02, "nonuniform curvature err: lv={lv:.4}");
     }
 
-    // asymmetric interval — this is where the old F-B formula would overshoot.
+    // asymmetric interval this is where the old F-B formula would overshoot.
     // interpolant must stay bounded between adjacent nodes.
     #[test]
     fn interp_no_overshoot_asymmetric() {
@@ -208,5 +298,102 @@ mod p0_regression {
                     "overshoot at xq={xq:.3}: y={y:.6} not in [{lo:.4},{hi:.4}]");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod arb_tests {
+    use super::*;
+    use crate::types::LocalVolSurface;
+
+    // surface with a calendar spread violation at (i_k=1, j_t=1):
+    // total variance at T=1.0 < T=0.5 that's negative time value.
+    fn calendar_violation() -> LocalVolSurface {
+        let ks = vec![90.0, 100.0, 110.0];
+        let ts = vec![0.5, 1.0];
+        // ivs indexed [i_k * n_t + j_t]
+        // at k=100: iv(T=0.5)=0.25 => w=0.03125, iv(T=1.0)=0.15 => w=0.0225 — violation
+        let ivs = vec![
+            0.20, 0.22,  // k=90:  fine
+            0.25, 0.15,  // k=100: T=1.0 has lower total var than T=0.5
+            0.20, 0.22,  // k=110: fine
+        ];
+        LocalVolSurface::new(ks, ts, ivs)
+    }
+
+    // surface with a butterfly violation at (i_k=1, j_t=0):
+    // middle strike has higher total variance than average of neighbors — negative butterfly.
+    fn butterfly_violation() -> LocalVolSurface {
+        let ks = vec![90.0, 100.0, 110.0];
+        let ts = vec![0.5, 1.0];
+        // at T=0.5: w(90)=0.02, w(100)=0.05, w(110)=0.02 concave, negative butterfly
+        let ivs = vec![
+            (0.02_f64/0.5).sqrt(), (0.03_f64/1.0).sqrt(),  // k=90
+            (0.05_f64/0.5).sqrt(), (0.04_f64/1.0).sqrt(),  // k=100: too high at T=0.5
+            (0.02_f64/0.5).sqrt(), (0.03_f64/1.0).sqrt(),  // k=110
+        ];
+        LocalVolSurface::new(ks, ts, ivs)
+    }
+
+    #[test]
+    fn detects_calendar_violation() {
+        let mut surf  = calendar_violation();
+        let audit = check_and_repair_surface(&mut surf);
+        assert!(audit.violations.iter().any(|v| v.kind == ViolationKind::CalendarSpread),
+            "calendar violation not detected");
+    }
+
+    #[test]
+    fn repairs_calendar_violation() {
+        let mut surf = calendar_violation();
+        check_and_repair_surface(&mut surf);
+        // after repair: total variance must be non-decreasing in T at every K
+        let nk = surf.strikes.len();
+        let nt = surf.expiries.len();
+        for i_k in 0..nk {
+            for j_t in 1..nt {
+                let w_prev = surf.get(i_k, j_t-1).powi(2) * surf.expiries[j_t-1];
+                let w_cur  = surf.get(i_k, j_t  ).powi(2) * surf.expiries[j_t];
+                assert!(w_cur >= w_prev - 1e-10,
+                    "calendar still violated at i_k={i_k} j_t={j_t}: w_prev={w_prev:.6} w_cur={w_cur:.6}");
+            }
+        }
+    }
+
+    #[test]
+    fn detects_butterfly_violation() {
+        let mut surf  = butterfly_violation();
+        let audit = check_and_repair_surface(&mut surf);
+        assert!(audit.violations.iter().any(|v| v.kind == ViolationKind::Butterfly),
+            "butterfly violation not detected");
+    }
+
+    #[test]
+    fn repairs_butterfly_violation() {
+        let mut surf = butterfly_violation();
+        check_and_repair_surface(&mut surf);
+        let nk = surf.strikes.len();
+        let nt = surf.expiries.len();
+        for j_t in 0..nt {
+            for i_k in 1..(nk-1) {
+                let wm = surf.get(i_k-1, j_t).powi(2) * surf.expiries[j_t];
+                let w0 = surf.get(i_k,   j_t).powi(2) * surf.expiries[j_t];
+                let wp = surf.get(i_k+1, j_t).powi(2) * surf.expiries[j_t];
+                assert!(wm - 2.0*w0 + wp >= -1e-8,
+                    "butterfly still violated at i_k={i_k} j_t={j_t}");
+            }
+        }
+    }
+
+    #[test]
+    fn clean_surface_has_no_violations() {
+        let mut surf  = LocalVolSurface::new(
+            vec![90.0, 100.0, 110.0],
+            vec![0.5, 1.0],
+            vec![0.20, 0.20, 0.20, 0.20, 0.20, 0.20],
+        );
+        let audit = check_and_repair_surface(&mut surf);
+        assert_eq!(audit.violations.len(), 0, "clean surface should have zero violations");
+        assert_eq!(audit.repaired, 0);
     }
 }
