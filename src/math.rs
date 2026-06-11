@@ -1,28 +1,21 @@
 // rational approx for Phi and Phi^-1.
 // faster than libm erf in tight loops, ~2x on my box.
-// error is ~1e-9 which is more than enough — we're not doing nuclear physics.
+// ncdf: delegates to libm::erfc full double precision in the tails.
+// replaces A&S 26.2.17 which had ~1.5e-7 tail error. matters for deep OTM IV solving.
 
 const SQRT_2PI_INV: f64 = 0.3989422804014327;
+const SQRT_2_INV:   f64 = std::f64::consts::FRAC_1_SQRT_2;
 
 #[inline(always)]
 pub fn npdf(x: f64) -> f64 {
     SQRT_2PI_INV * (-0.5 * x * x).exp()
 }
 
-// Abramowitz & Stegun 26.2.17 — fast, good to 1.5e-9
+// erfc-based. error ~1e-15 uniform, no branch-cut issues in the tails.
+// phi(x) = erfc(-x / sqrt(2)) / 2
 #[inline]
 pub fn ncdf(x: f64) -> f64 {
-    if x < -8.0 { return 0.0; }
-    if x >  8.0 { return 1.0; }
-
-    const A: [f64; 5] = [
-        0.319381530, -0.356563782,
-        1.781477937, -1.821255978, 1.330274429,
-    ];
-    let k = 1.0 / (1.0 + 0.2316419 * x.abs());
-    let poly = ((((A[4]*k + A[3])*k + A[2])*k + A[1])*k + A[0]) * k;
-    let p = 1.0 - npdf(x) * poly;
-    if x >= 0.0 { p } else { 1.0 - p }
+    0.5 * libm::erfc(-x * SQRT_2_INV)
 }
 
 // Acklam (2002). used for IV initial guess.
@@ -63,9 +56,24 @@ mod tests {
 
     #[test]
     fn ncdf_sanity() {
-        assert!((ncdf(0.0) - 0.5).abs() < 1e-9);
-        assert!((ncdf(1.6449) - 0.95).abs() < 1e-4);
-        assert!(ncdf(-10.0) < 1e-10);
+        assert!((ncdf(0.0) - 0.5).abs() < 1e-15);
+        assert!((ncdf(1.6449) - 0.95).abs() < 1e-6);
+        assert!(ncdf(-10.0) < 1e-23);
+    }
+
+    #[test]
+    fn ncdf_tail_precision() {
+        // known values via high-precision tables
+        let cases = [
+            (-4.0_f64, 3.167124183311998e-5),
+            (-5.0_f64, 2.866515718791939e-7),
+            (-6.0_f64, 9.865876449133282e-10),
+        ];
+        for (x, expected) in cases {
+            let got     = ncdf(x);
+            let rel_err = (got - expected).abs() / expected;
+            assert!(rel_err < 1e-10, "ncdf({x}) = {got:.6e}, expected {expected:.6e}, rel_err={rel_err:.2e}");
+        }
     }
 
     #[test]
