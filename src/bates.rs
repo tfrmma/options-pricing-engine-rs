@@ -10,7 +10,7 @@
 
 use num_complex::Complex64;
 use crate::types::{BatesParams, OptionType, PricingResult};
-use crate::heston::{heston_price, stable_cf, gk_integrate};
+use crate::heston::{stable_cf, gk_integrate};
 
 pub fn bates_price(
     spot: f64, strike: f64, expiry: f64,
@@ -127,6 +127,7 @@ mod tests {
 
     #[test]
     fn recovers_heston_no_jumps() {
+        use crate::heston_price;
         let bp = BatesParams { heston: base(), lambda: 0.0, mu_j: 0.0, sigma_j: 1e-8 };
         let bates_px  = bates_price(100.0, 100.0, 1.0, 0.05, 0.0, &bp, OptionType::Call);
         let heston_px = heston_price(100.0, 100.0, 1.0, 0.05, 0.0, &base(), OptionType::Call);
