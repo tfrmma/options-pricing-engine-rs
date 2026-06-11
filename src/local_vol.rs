@@ -102,7 +102,7 @@ pub fn monotone_cubic_interp(xs: &[f64], ys: &[f64], xq: f64) -> f64 {
     let mi  = slope(xs, ys, i);
     let mi1 = slope(xs, ys, i+1);
 
-    // Fritsch-Butland limiter prevents overshoot.
+    // Fritsch-Butland limiter — prevents overshoot.
     // condition: alpha^2 + alpha*beta + beta^2 <= 9, where alpha=mi/delta, beta=mi1/delta.
     // if violated, scale both slopes down uniformly so we sit on the boundary.
     // the sqrt formula that was here before is not F-B. it's a made-up norm that
@@ -155,8 +155,9 @@ pub enum ViolationKind {
 }
 
 pub struct SurfaceAudit {
-    pub violations: Vec<SurfaceViolation>,
+    pub violations: Vec<SurfaceViolation>,  // accumulated across all passes
     pub repaired:   usize,
+    pub passes:     usize,
 }
 
 // checks and repairs a LocalVolSurface in-place.
@@ -164,7 +165,7 @@ pub struct SurfaceAudit {
 // butterfly: w(K-) - 2*w(K) + w(K+) >= 0 (convexity in strike space).
 //
 // repair strategy: minimum upward adjustment on the offending node.
-// we don't touch neighbors repair is conservative and local.
+// we don't touch neighbors, repair is conservative and local.
 // if the surface is badly broken, run multiple passes until clean.
 pub fn check_and_repair_surface(surf: &mut LocalVolSurface) -> SurfaceAudit {
     let mut violations = vec![];
@@ -215,10 +216,29 @@ pub fn check_and_repair_surface(surf: &mut LocalVolSurface) -> SurfaceAudit {
         }
     }
 
-    SurfaceAudit { violations, repaired }
+    SurfaceAudit { violations, repaired, passes: 1 }
 }
 
-// inline helper avoids borrowing surf mutably while we read
+// multi-pass repair. loops until clean or max_passes hit.
+// if you're hitting 10+ passes, fix your input data.
+pub fn repair_surface_to_clean(surf: &mut LocalVolSurface, max_passes: usize) -> SurfaceAudit {
+    let mut all_violations = vec![];
+    let mut total_repaired = 0;
+    let mut passes         = 0;
+
+    for _ in 0..max_passes {
+        passes += 1;
+        let audit = check_and_repair_surface(surf);
+        let clean = audit.repaired == 0;
+        total_repaired += audit.repaired;
+        all_violations.extend(audit.violations);
+        if clean { break; }
+    }
+
+    SurfaceAudit { violations: all_violations, repaired: total_repaired, passes }
+}
+
+// inline helper, avoids borrowing surf mutably while we read
 #[inline]
 fn total_var_raw(ivs: &[f64], nk: usize, nt: usize, i_k: usize, j_t: usize, t: f64) -> f64 {
     let iv = ivs[i_k * nt + j_t];
@@ -282,7 +302,7 @@ mod p0_regression {
         assert!((lv - 0.2).abs() < 0.02, "nonuniform curvature err: lv={lv:.4}");
     }
 
-    // asymmetric interval this is where the old F-B formula would overshoot.
+    // asymmetric interval, this is where the old F-B formula would overshoot.
     // interpolant must stay bounded between adjacent nodes.
     #[test]
     fn interp_no_overshoot_asymmetric() {
@@ -307,12 +327,12 @@ mod arb_tests {
     use crate::types::LocalVolSurface;
 
     // surface with a calendar spread violation at (i_k=1, j_t=1):
-    // total variance at T=1.0 < T=0.5 that's negative time value.
+    // total variance at T=1.0 < T=0.5, that's negative time value.
     fn calendar_violation() -> LocalVolSurface {
         let ks = vec![90.0, 100.0, 110.0];
         let ts = vec![0.5, 1.0];
         // ivs indexed [i_k * n_t + j_t]
-        // at k=100: iv(T=0.5)=0.25 => w=0.03125, iv(T=1.0)=0.15 => w=0.0225 — violation
+        // at k=100: iv(T=0.5)=0.25 => w=0.03125, iv(T=1.0)=0.15 => w=0.0225, violation
         let ivs = vec![
             0.20, 0.22,  // k=90:  fine
             0.25, 0.15,  // k=100: T=1.0 has lower total var than T=0.5
@@ -322,7 +342,7 @@ mod arb_tests {
     }
 
     // surface with a butterfly violation at (i_k=1, j_t=0):
-    // middle strike has higher total variance than average of neighbors — negative butterfly.
+    // middle strike has higher total variance than average of neighbors negative butterfly.
     fn butterfly_violation() -> LocalVolSurface {
         let ks = vec![90.0, 100.0, 110.0];
         let ts = vec![0.5, 1.0];
@@ -394,6 +414,63 @@ mod arb_tests {
         );
         let audit = check_and_repair_surface(&mut surf);
         assert_eq!(audit.violations.len(), 0, "clean surface should have zero violations");
+        assert_eq!(audit.repaired, 0);
+        assert_eq!(audit.passes, 1);
+    }
+
+    // a surface where fixing a calendar spread creates a butterfly violation.
+    // single pass won't clean it. multi-pass should.
+    #[test]
+    fn multipass_cleans_cascading_violations() {
+        // k=100, T=1.0 has lower total var than T=0.5 (calendar violation).
+        // after repair, the raised iv at T=1.0 breaks butterfly convexity.
+        // a single check_and_repair_surface pass detects calendar but may leave butterfly.
+        // repair_surface_to_clean should handle both.
+        let ks = vec![90.0, 100.0, 110.0];
+        let ts = vec![0.5, 1.0, 2.0];
+        // w at k=100: T=0.5 => 0.040, T=1.0 => 0.020 (violation), T=2.0 => 0.060
+        // after calendar fix at T=1.0: w bumped to ~0.040 => iv ~0.20
+        // but now k=100 at T=1.0 may violate butterfly vs k=90,k=110
+        let ivs = vec![
+            0.20, 0.20, 0.20,   // k=90:  w = 0.02, 0.04, 0.08
+            (0.04_f64/0.5).sqrt(), (0.02_f64/1.0).sqrt(), (0.06_f64/2.0).sqrt(),  // k=100: calendar violation at T=1.0
+            0.20, 0.20, 0.20,   // k=110: w = 0.02, 0.04, 0.08
+        ];
+        let mut surf = LocalVolSurface::new(ks, ts, ivs);
+        let audit = repair_surface_to_clean(&mut surf, 10);
+
+        // surface must be fully clean after multi-pass
+        let nk = surf.strikes.len();
+        let nt = surf.expiries.len();
+        for i_k in 0..nk {
+            for j_t in 1..nt {
+                let w_prev = surf.get(i_k, j_t-1).powi(2) * surf.expiries[j_t-1];
+                let w_cur  = surf.get(i_k, j_t  ).powi(2) * surf.expiries[j_t];
+                assert!(w_cur >= w_prev - 1e-10, "calendar still violated after multipass");
+            }
+        }
+        for j_t in 0..nt {
+            for i_k in 1..(nk-1) {
+                let wm = surf.get(i_k-1, j_t).powi(2) * surf.expiries[j_t];
+                let w0 = surf.get(i_k,   j_t).powi(2) * surf.expiries[j_t];
+                let wp = surf.get(i_k+1, j_t).powi(2) * surf.expiries[j_t];
+                assert!(wm - 2.0*w0 + wp >= -1e-8, "butterfly still violated after multipass");
+            }
+        }
+
+        assert!(audit.passes >= 1);
+        assert!(audit.violations.len() > 0, "should have found violations");
+    }
+
+    #[test]
+    fn multipass_clean_surface_takes_one_pass() {
+        let mut surf = LocalVolSurface::new(
+            vec![90.0, 100.0, 110.0],
+            vec![0.5, 1.0],
+            vec![0.20; 6],
+        );
+        let audit = repair_surface_to_clean(&mut surf, 10);
+        assert_eq!(audit.passes, 1);
         assert_eq!(audit.repaired, 0);
     }
 }
