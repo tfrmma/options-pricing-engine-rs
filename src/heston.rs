@@ -6,9 +6,12 @@
 //
 // Integration: GK-15. don't swap this for trapezoidal rule.
 // if you need it faster, calibrate offline and cache the surface.
+//
+// Greeks: bump-and-reprice. not pretty but correct.
+// AD or complex-step would be faster; add it when it matters.
 
 use num_complex::Complex64;
-use crate::types::{HestonParams, OptionType};
+use crate::types::{HestonParams, OptionType, PricingResult};
 
 // standard GK-15 nodes/weights on [-1,1]
 const GK_NODES: [f64; 15] = [
@@ -44,6 +47,75 @@ pub fn heston_price(
         // put via parity — why integrate twice
         OptionType::Put  => call - spot*(-div_yield*expiry).exp() + strike*(-rate*expiry).exp(),
     }
+}
+
+// bump sizes: dS = 1% spot, dv = 1 vol point, dr = 1bp, dt = 1 calendar day.
+// vanna and volga via double bump — 4 extra pricing calls each, worth it for
+// second-order accuracy.
+pub fn heston_price_and_greeks(
+    spot: f64, strike: f64, expiry: f64,
+    rate: f64, div_yield: f64,
+    params: &HestonParams, opt_type: OptionType,
+) -> PricingResult {
+    let price = heston_price(spot, strike, expiry, rate, div_yield, params, opt_type);
+
+    let ds  = 0.01 * spot;
+    let dv  = 0.01;
+    let dr  = 1e-4;
+    let dt  = 1.0 / 365.0;
+
+    let pu  = heston_price(spot + ds, strike, expiry, rate, div_yield, params, opt_type);
+    let pd  = heston_price(spot - ds, strike, expiry, rate, div_yield, params, opt_type);
+    let delta = (pu - pd) / (2.0 * ds);
+    let gamma = (pu - 2.0*price + pd) / (ds * ds);
+
+    // vega: bump v0 (initial variance). dv is in vol units so bump v0 by (v+dv)^2 - v^2
+    let v0     = params.v0;
+    let v_cur  = v0.sqrt();
+    let p_vup  = params_with_v0(params, (v_cur + dv).powi(2));
+    let p_vdn  = params_with_v0(params, (v_cur - dv).max(1e-8).powi(2));
+    let vega   = (heston_price(spot, strike, expiry, rate, div_yield, &p_vup, opt_type)
+                - heston_price(spot, strike, expiry, rate, div_yield, &p_vdn, opt_type))
+               / (2.0 * dv);
+
+    // theta: bump expiry down. clamp so we don't go negative.
+    let t_dn  = (expiry - dt).max(1e-6);
+    let theta = (heston_price(spot, strike, t_dn, rate, div_yield, params, opt_type) - price) / dt;
+
+    let rho   = (heston_price(spot, strike, expiry, rate + dr, div_yield, params, opt_type)
+               - heston_price(spot, strike, expiry, rate - dr, div_yield, params, opt_type))
+              / (2.0 * dr);
+
+    // vanna = d(delta)/d(vol). cross bump: (delta at v+dv) - (delta at v-dv)
+    let delta_vup = {
+        let pu = heston_price(spot + ds, strike, expiry, rate, div_yield, &p_vup, opt_type);
+        let pd = heston_price(spot - ds, strike, expiry, rate, div_yield, &p_vup, opt_type);
+        (pu - pd) / (2.0 * ds)
+    };
+    let delta_vdn = {
+        let pu = heston_price(spot + ds, strike, expiry, rate, div_yield, &p_vdn, opt_type);
+        let pd = heston_price(spot - ds, strike, expiry, rate, div_yield, &p_vdn, opt_type);
+        (pu - pd) / (2.0 * ds)
+    };
+    let vanna = (delta_vup - delta_vdn) / (2.0 * dv);
+
+    // volga = d(vega)/d(vol). second derivative of price w.r.t. vol.
+    let p_vup2 = params_with_v0(params, (v_cur + 2.0*dv).powi(2));
+    let p_vdn2 = params_with_v0(params, (v_cur - 2.0*dv).max(1e-8).powi(2));
+    let vega_up = (heston_price(spot, strike, expiry, rate, div_yield, &p_vup2, opt_type)
+                 - heston_price(spot, strike, expiry, rate, div_yield, params, opt_type))
+                / (2.0 * dv);
+    let vega_dn = (heston_price(spot, strike, expiry, rate, div_yield, params, opt_type)
+                 - heston_price(spot, strike, expiry, rate, div_yield, &p_vdn2, opt_type))
+                / (2.0 * dv);
+    let volga   = (vega_up - vega_dn) / (2.0 * dv);
+
+    PricingResult { price, delta, gamma, vega, theta, rho, vanna, volga }
+}
+
+#[inline]
+fn params_with_v0(p: &HestonParams, v0: f64) -> HestonParams {
+    HestonParams { v0, ..*p }
 }
 
 fn heston_call(s: f64, k: f64, t: f64, r: f64, q: f64, p: &HestonParams) -> f64 {
@@ -129,5 +201,40 @@ mod tests {
     #[test]
     fn feller_condition() {
         assert!(params().feller_ok());
+    }
+
+    #[test]
+    fn greeks_signs() {
+        let p = params();
+        let r = heston_price_and_greeks(100.0, 100.0, 1.0, 0.05, 0.0, &p, OptionType::Call);
+        assert!(r.delta > 0.0 && r.delta < 1.0, "delta={}", r.delta);
+        assert!(r.gamma > 0.0, "gamma={}", r.gamma);
+        assert!(r.vega  > 0.0, "vega={}", r.vega);
+        assert!(r.rho   > 0.0, "rho={}", r.rho);
+    }
+
+    #[test]
+    fn greeks_put_delta_negative() {
+        let p = params();
+        let r = heston_price_and_greeks(100.0, 100.0, 1.0, 0.05, 0.0, &p, OptionType::Put);
+        assert!(r.delta < 0.0 && r.delta > -1.0, "put delta={}", r.delta);
+        assert!(r.gamma > 0.0, "gamma={}", r.gamma);
+    }
+
+    // bump-and-reprice delta should be close to BSM delta for low vol-of-vol
+    #[test]
+    fn delta_close_to_bsm() {
+        use crate::bsm::bsm_price_and_greeks;
+        use crate::types::OptionContract;
+        // near-BSM params: low sigma (vol of vol), v0 = vol^2
+        let p = HestonParams { v0: 0.04, kappa: 10.0, theta: 0.04, sigma: 0.01, rho: 0.0 };
+        let h = heston_price_and_greeks(100.0, 100.0, 1.0, 0.05, 0.0, &p, OptionType::Call);
+        let b = bsm_price_and_greeks(&OptionContract {
+            spot: 100.0, strike: 100.0, expiry: 1.0,
+            rate: 0.05, div_yield: 0.0, vol: 0.2,
+            opt_type: OptionType::Call,
+        });
+        assert!((h.delta - b.delta).abs() < 0.01, "heston delta={:.4} bsm delta={:.4}", h.delta, b.delta);
+        assert!((h.vega  - b.vega ).abs() < 1.0,  "heston vega={:.4}  bsm vega={:.4}",  h.vega,  b.vega);
     }
 }
