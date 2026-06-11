@@ -19,6 +19,6 @@ pub use iv::implied_vol;
 pub use heston::{heston_price, heston_price_and_greeks};
 pub use bates::{bates_price, bates_price_and_greeks};
 pub use local_vol::{dupire_local_vol, monotone_cubic_interp, check_and_repair_surface,
-                     SurfaceAudit, SurfaceViolation, ViolationKind};
+                     repair_surface_to_clean, SurfaceAudit, SurfaceViolation, ViolationKind};
 pub use calibration::{calibrate_heston, CalibInput, CalibResult};
 pub use batch::{batch_bsm, batch_bsm_price, batch_heston, batch_bates, batch_implied_vol};
