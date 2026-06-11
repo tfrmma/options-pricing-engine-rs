@@ -13,7 +13,7 @@
 use crate::types::LocalVolSurface;
 
 // returns local vol (not variance) at grid node (i_k, j_t).
-// returns 0.0 if the result is degenerate, clean your surface if this happens a lot.
+// returns 0.0 if the result is degenerate — clean your surface if this happens a lot.
 pub fn dupire_local_vol(
     surf: &LocalVolSurface,
     spot: f64, rate: f64, div_yield: f64,
@@ -102,11 +102,11 @@ pub fn monotone_cubic_interp(xs: &[f64], ys: &[f64], xq: f64) -> f64 {
     let mi  = slope(xs, ys, i);
     let mi1 = slope(xs, ys, i+1);
 
-    // Fritsch-Butland limiter — prevents overshoot.
+    // Fritsch-Butland limiter prevents overshoot.
     // condition: alpha^2 + alpha*beta + beta^2 <= 9, where alpha=mi/delta, beta=mi1/delta.
     // if violated, scale both slopes down uniformly so we sit on the boundary.
     // the sqrt formula that was here before is not F-B. it's a made-up norm that
-    // happens to limit *something* but not the right thing — it'll overshoot on
+    // happens to limit *something* but not the right thing it'll overshoot on
     // asymmetric intervals.
     let delta = (ys[i+1] - ys[i]) / dx;
     let lim = if delta.abs() < 1e-15 { 0.0 } else {
@@ -165,7 +165,7 @@ pub struct SurfaceAudit {
 // butterfly: w(K-) - 2*w(K) + w(K+) >= 0 (convexity in strike space).
 //
 // repair strategy: minimum upward adjustment on the offending node.
-// we don't touch neighbors, repair is conservative and local.
+// we don't touch neighbors — repair is conservative and local.
 // if the surface is badly broken, run multiple passes until clean.
 pub fn check_and_repair_surface(surf: &mut LocalVolSurface) -> SurfaceAudit {
     let mut violations = vec![];
@@ -238,9 +238,9 @@ pub fn repair_surface_to_clean(surf: &mut LocalVolSurface, max_passes: usize) ->
     SurfaceAudit { violations: all_violations, repaired: total_repaired, passes }
 }
 
-// inline helper, avoids borrowing surf mutably while we read
+// inline helper — avoids borrowing surf mutably while we read
 #[inline]
-fn total_var_raw(ivs: &[f64], nk: usize, nt: usize, i_k: usize, j_t: usize, t: f64) -> f64 {
+fn total_var_raw(ivs: &[f64], _nk: usize, nt: usize, i_k: usize, j_t: usize, t: f64) -> f64 {
     let iv = ivs[i_k * nt + j_t];
     iv * iv * t
 }
@@ -302,12 +302,12 @@ mod p0_regression {
         assert!((lv - 0.2).abs() < 0.02, "nonuniform curvature err: lv={lv:.4}");
     }
 
-    // asymmetric interval, this is where the old F-B formula would overshoot.
+    // asymmetric interval — this is where the old F-B formula would overshoot.
     // interpolant must stay bounded between adjacent nodes.
     #[test]
     fn interp_no_overshoot_asymmetric() {
-        let xs = vec![0.0, 0.1, 0.11, 1.0, 2.0];
-        let ys = vec![0.0, 0.5,  0.5, 0.6, 0.7];
+        let xs: Vec<f64> = vec![0.0, 0.1, 0.11, 1.0, 2.0];
+        let ys: Vec<f64> = vec![0.0, 0.5,  0.5, 0.6, 0.7];
         for j in 0..4 {
             let lo = ys[j].min(ys[j+1]);
             let hi = ys[j].max(ys[j+1]);
@@ -327,12 +327,12 @@ mod arb_tests {
     use crate::types::LocalVolSurface;
 
     // surface with a calendar spread violation at (i_k=1, j_t=1):
-    // total variance at T=1.0 < T=0.5, that's negative time value.
+    // total variance at T=1.0 < T=0.5 — that's negative time value.
     fn calendar_violation() -> LocalVolSurface {
         let ks = vec![90.0, 100.0, 110.0];
         let ts = vec![0.5, 1.0];
         // ivs indexed [i_k * n_t + j_t]
-        // at k=100: iv(T=0.5)=0.25 => w=0.03125, iv(T=1.0)=0.15 => w=0.0225, violation
+        // at k=100: iv(T=0.5)=0.25 => w=0.03125, iv(T=1.0)=0.15 => w=0.0225 — violation
         let ivs = vec![
             0.20, 0.22,  // k=90:  fine
             0.25, 0.15,  // k=100: T=1.0 has lower total var than T=0.5
@@ -342,11 +342,11 @@ mod arb_tests {
     }
 
     // surface with a butterfly violation at (i_k=1, j_t=0):
-    // middle strike has higher total variance than average of neighbors negative butterfly.
+    // middle strike has higher total variance than average of neighbors — negative butterfly.
     fn butterfly_violation() -> LocalVolSurface {
         let ks = vec![90.0, 100.0, 110.0];
         let ts = vec![0.5, 1.0];
-        // at T=0.5: w(90)=0.02, w(100)=0.05, w(110)=0.02 concave, negative butterfly
+        // at T=0.5: w(90)=0.02, w(100)=0.05, w(110)=0.02 — concave, negative butterfly
         let ivs = vec![
             (0.02_f64/0.5).sqrt(), (0.03_f64/1.0).sqrt(),  // k=90
             (0.05_f64/0.5).sqrt(), (0.04_f64/1.0).sqrt(),  // k=100: too high at T=0.5
