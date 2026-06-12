@@ -102,11 +102,11 @@ pub fn monotone_cubic_interp(xs: &[f64], ys: &[f64], xq: f64) -> f64 {
     let mi  = slope(xs, ys, i);
     let mi1 = slope(xs, ys, i+1);
 
-    // Fritsch-Butland limiter prevents overshoot.
+    // Fritsch-Butland limiter — prevents overshoot.
     // condition: alpha^2 + alpha*beta + beta^2 <= 9, where alpha=mi/delta, beta=mi1/delta.
     // if violated, scale both slopes down uniformly so we sit on the boundary.
     // the sqrt formula that was here before is not F-B. it's a made-up norm that
-    // happens to limit *something* but not the right thing it'll overshoot on
+    // happens to limit *something* but not the right thing — it'll overshoot on
     // asymmetric intervals.
     let delta = (ys[i+1] - ys[i]) / dx;
     let lim = if delta.abs() < 1e-15 { 0.0 } else {
