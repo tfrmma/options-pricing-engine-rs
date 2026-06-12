@@ -87,18 +87,28 @@ fn params_with_v0(p: &BatesParams, v0: f64) -> BatesParams {
 }
 
 fn bates_call(s: f64, k: f64, t: f64, r: f64, q: f64, bp: &BatesParams) -> f64 {
-    let x  = (s/k).ln() + (r - q)*t;
-    let i1 = gk_integrate(|u| bates_integrand(u, x, t, r, bp, true));
-    let i2 = gk_integrate(|u| bates_integrand(u, x, t, r, bp, false));
+    // x = ln(S/K) — see heston.rs for the derivation of why this (and not
+    // ln(F/K)) plus a positive exponential sign is the correct combination.
+    let x  = (s/k).ln();
+
+    // CF(-i) normalizer for P1, including the jump component.
+    let phi_mi = Complex64::new(0.0, -1.0);
+    let cf_mi  = stable_cf(phi_mi, t, r, &bp.heston) * jump_cf(phi_mi, t, bp);
+
+    let i1 = gk_integrate(|u| bates_integrand(u, x, t, r, bp, true, Some(cf_mi)));
+    let i2 = gk_integrate(|u| bates_integrand(u, x, t, r, bp, false, None));
     let p1 = 0.5 + i1 / std::f64::consts::PI;
     let p2 = 0.5 + i2 / std::f64::consts::PI;
     (s*(-q*t).exp()*p1 - k*(-r*t).exp()*p2).max(0.0)
 }
 
-fn bates_integrand(u: f64, x: f64, t: f64, r: f64, bp: &BatesParams, is_p1: bool) -> f64 {
+fn bates_integrand(u: f64, x: f64, t: f64, r: f64, bp: &BatesParams, is_p1: bool, cf_mi: Option<Complex64>) -> f64 {
     let phi = if is_p1 { Complex64::new(u, -1.0) } else { Complex64::new(u, 0.0) };
-    let cf  = stable_cf(phi, t, r, &bp.heston) * jump_cf(phi, t, bp);
-    let num = Complex64::new(0.0, -u * x).exp() * cf;
+    let mut cf  = stable_cf(phi, t, r, &bp.heston) * jump_cf(phi, t, bp);
+    if let Some(norm) = cf_mi {
+        cf /= norm;
+    }
+    let num = Complex64::new(0.0, u * x).exp() * cf;
     (num / Complex64::new(0.0, u)).re
 }
 
