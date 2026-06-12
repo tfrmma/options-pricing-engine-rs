@@ -120,10 +120,16 @@ fn params_with_v0(p: &HestonParams, v0: f64) -> HestonParams {
 
 fn heston_call(s: f64, k: f64, t: f64, r: f64, q: f64, p: &HestonParams) -> f64 {
     // Gil-Pelaez inversion: C = S*e^(-qT)*P1 - K*e^(-rT)*P2
-    let x = (s/k).ln() + (r - q)*t; // ln(F/K)
+    // x = ln(S/K) — log-moneyness (NOT log-forward-moneyness; the rate term
+    // is already carried by the CF itself).
+    let x = (s/k).ln();
 
-    let i1 = gk_integrate(|u| cf_integrand(u, x, t, r, p, true));
-    let i2 = gk_integrate(|u| cf_integrand(u, x, t, r, p, false));
+    // CF(-i) = e^{(r-q)T} is the normalizer that turns CF(u-i) into the
+    // characteristic function under the stock-measure (needed for P1).
+    let cf_mi = stable_cf(Complex64::new(0.0, -1.0), t, r, p);
+
+    let i1 = gk_integrate(|u| cf_integrand(u, x, t, r, p, true, Some(cf_mi)));
+    let i2 = gk_integrate(|u| cf_integrand(u, x, t, r, p, false, None));
 
     let p1 = 0.5 + i1 / std::f64::consts::PI;
     let p2 = 0.5 + i2 / std::f64::consts::PI;
@@ -131,10 +137,13 @@ fn heston_call(s: f64, k: f64, t: f64, r: f64, q: f64, p: &HestonParams) -> f64 
     (s*(-q*t).exp()*p1 - k*(-r*t).exp()*p2).max(0.0)
 }
 
-fn cf_integrand(u: f64, x: f64, t: f64, r: f64, p: &HestonParams, is_p1: bool) -> f64 {
+fn cf_integrand(u: f64, x: f64, t: f64, r: f64, p: &HestonParams, is_p1: bool, cf_mi: Option<Complex64>) -> f64 {
     let phi = if is_p1 { Complex64::new(u, -1.0) } else { Complex64::new(u, 0.0) };
-    let cf  = stable_cf(phi, t, r, p);
-    let num = Complex64::new(0.0, -u * x).exp() * cf;
+    let mut cf  = stable_cf(phi, t, r, p);
+    if let Some(norm) = cf_mi {
+        cf /= norm;
+    }
+    let num = Complex64::new(0.0, u * x).exp() * cf;
     (num / Complex64::new(0.0, u)).re
 }
 
