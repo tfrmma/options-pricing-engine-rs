@@ -230,13 +230,18 @@ mod tests {
         assert!(r.gamma > 0.0, "gamma={}", r.gamma);
     }
 
-    // bump-and-reprice delta should be close to BSM delta for low vol-of-vol
+    // bump-and-reprice delta/vega should be close to BSM for low vol-of-vol
+    // AND slow mean reversion. kappa matters here: with fast mean reversion
+    // (large kappa), a bump in v0 barely moves the integrated variance over
+    // [0,T] (d(IntVar)/dv0 ~ (1-e^{-kappa*T})/kappa -> 0), so Heston vega is
+    // naturally much smaller than BSM vega even though delta/gamma still
+    // line up. Use small kappa so v0 ~ integrated variance, like BSM assumes.
     #[test]
     fn delta_close_to_bsm() {
         use crate::bsm::bsm_price_and_greeks;
         use crate::types::OptionContract;
-        // near-BSM params: low sigma (vol of vol), v0 = vol^2
-        let p = HestonParams { v0: 0.04, kappa: 10.0, theta: 0.04, sigma: 0.01, rho: 0.0 };
+        // near-BSM params: low sigma (vol of vol), slow mean reversion, v0 = vol^2
+        let p = HestonParams { v0: 0.04, kappa: 0.1, theta: 0.04, sigma: 0.01, rho: 0.0 };
         let h = heston_price_and_greeks(100.0, 100.0, 1.0, 0.05, 0.0, &p, OptionType::Call);
         let b = bsm_price_and_greeks(&OptionContract {
             spot: 100.0, strike: 100.0, expiry: 1.0,
