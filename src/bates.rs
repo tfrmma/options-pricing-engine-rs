@@ -180,4 +180,35 @@ mod tests {
         assert!((b.delta - h.delta).abs() < 0.01, "delta: bates={:.4} heston={:.4}", b.delta, h.delta);
         assert!((b.vega  - h.vega ).abs() < 1.0,  "vega:  bates={:.4} heston={:.4}", b.vega,  h.vega);
     }
+
+    // Bates prices through the same CF-inversion quadrature as Heston, so the
+    // fixed-panel under-resolution produced the same arbitrage-violating prices
+    // here. A call must sit in [intrinsic, S*e^{-qT}] and decrease with strike.
+    #[test]
+    fn no_static_arbitrage() {
+        let sets = [
+            BatesParams { heston: base(), lambda: 0.5, mu_j: -0.1, sigma_j: 0.15 },
+            BatesParams {
+                heston: HestonParams { v0: 0.09, kappa: 1.0, theta: 0.09, sigma: 0.8, rho: -0.5 },
+                lambda: 1.0, mu_j: -0.2, sigma_j: 0.25,
+            },
+        ];
+        let (s, r, q) = (100.0, 0.03, 0.0);
+        let expiries = [0.02_f64, 0.1, 0.25, 0.5, 1.0, 2.0];
+        let strikes  = [70.0_f64, 85.0, 100.0, 115.0, 130.0, 150.0, 200.0];
+        for bp in &sets {
+            for &t in &expiries {
+                let cap = s * (-q*t).exp();
+                let mut prev = f64::INFINITY;
+                for &k in &strikes {
+                    let c = bates_price(s, k, t, r, q, bp, OptionType::Call);
+                    let intrinsic = (s*(-q*t).exp() - k*(-r*t).exp()).max(0.0);
+                    assert!(c >= intrinsic - 1e-4, "bates call {c} < intrinsic {intrinsic} (T={t} K={k})");
+                    assert!(c <= cap + 1e-4,       "bates call {c} > spot cap {cap} (T={t} K={k})");
+                    assert!(c <= prev + 1e-4,      "bates call not monotone in K (T={t} K={k}): {c} > {prev}");
+                    prev = c;
+                }
+            }
+        }
+    }
 }

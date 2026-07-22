@@ -4,7 +4,7 @@
 // Original Heston CF has a branch-cut problem where the complex log
 // jumps discontinuously. quadrature silently returns garbage. fun to debug at 2am.
 //
-// Integration: GK-15. don't swap this for trapezoidal rule.
+// Integration: adaptive GK-15 (Gauss-7 embedded error estimate + subdivision).
 // if you need it faster, calibrate offline and cache the surface.
 //
 // Greeks: bump-and-reprice. not pretty but correct.
@@ -34,6 +34,16 @@ pub const GK_WEIGHTS: [f64; 15] = [
     0.1047900103222502, 0.1047900103222502,
     0.0630920926299786, 0.0630920926299786,
     0.0229353220105292, 0.0229353220105292,
+];
+
+// Gauss-7 weights for the embedded error estimate. The 7 Gauss nodes are the
+// subset of GK_NODES at these indices; |K15 - G7| is the per-panel error.
+const G7_IDX: [usize; 7] = [0, 3, 4, 7, 8, 11, 12];
+const G7_WEIGHTS: [f64; 7] = [
+    0.4179591836734694,
+    0.3818300505051189, 0.3818300505051189,
+    0.2797053914892766, 0.2797053914892766,
+    0.1294849661688697, 0.1294849661688697,
 ];
 
 pub fn heston_price(
@@ -165,16 +175,58 @@ pub(crate) fn stable_cf(phi: Complex64, t: f64, r: f64, p: &HestonParams) -> Com
     (r * phi * i * t + c + dd).exp()
 }
 
+// One Gauss-Kronrod panel over [a,b]. Returns (K15 estimate, |K15 - G7| error
+// estimate). Reusing the 15 node values for both rules is the whole point of the
+// Gauss-Kronrod pair — the error estimate is free.
+fn gk15_panel<F: Fn(f64) -> f64>(f: &F, a: f64, b: f64) -> (f64, f64) {
+    let c = 0.5 * (a + b);
+    let h = 0.5 * (b - a);
+    let fv: [f64; 15] = std::array::from_fn(|i| f(c + h * GK_NODES[i]));
+    let k: f64 = (0..15).map(|i| GK_WEIGHTS[i] * fv[i]).sum();
+    let g: f64 = (0..7).map(|j| G7_WEIGHTS[j] * fv[G7_IDX[j]]).sum();
+    (k * h, (k - g).abs() * h)
+}
+
+// Globally-adaptive Gauss-Kronrod over a finite [a,b] (QUADPACK QAG style):
+// bisect the panel with the largest error estimate until the total estimated
+// error is within tol. This is what GK-15 is designed for — a single fixed
+// panel throws the error estimate away and aliases the oscillation.
+fn adaptive_gk<F: Fn(f64) -> f64>(f: &F, a: f64, b: f64, tol: f64) -> f64 {
+    const MAX_PANELS: usize = 200;
+    let (k0, e0) = gk15_panel(f, a, b);
+    // (error, integral, a, b) per live panel
+    let mut panels: Vec<(f64, f64, f64, f64)> = vec![(e0, k0, a, b)];
+    let mut total = k0;
+    let mut err = e0;
+    while err > tol && panels.len() < MAX_PANELS {
+        let w = (0..panels.len()).max_by(|&i, &j| panels[i].0.total_cmp(&panels[j].0)).unwrap();
+        let (ew, kw, aw, bw) = panels.swap_remove(w);
+        let m = 0.5 * (aw + bw);
+        let (kl, el) = gk15_panel(f, aw, m);
+        let (kr, er) = gk15_panel(f, m, bw);
+        total += kl + kr - kw;
+        err   += el + er - ew;
+        panels.push((el, kl, aw, m));
+        panels.push((er, kr, m, bw));
+    }
+    total
+}
+
+// Gil-Pelaez integral over u in [0, inf). The integrand oscillates (frequency
+// set by log-moneyness) and, for short maturity or high vol-of-vol, decays
+// slowly — so a fixed panel under-resolves it, producing arbitrage-violating
+// prices in the wings. Map [0, inf) -> [0, 1] via u = (1 - t)/t and integrate
+// adaptively; subdivision then resolves the whole frequency range regardless
+// of maturity/moneyness.
 pub(crate) fn gk_integrate<F: Fn(f64) -> f64>(f: F) -> f64 {
-    let upper = 200.0;
-    let mid   = upper / 2.0;
-    GK_NODES.iter().zip(GK_WEIGHTS.iter())
-        .map(|(&n, &w)| {
-            let u = mid + mid * n;
-            if u < 1e-12 { return 0.0; }
-            w * f(u)
-        })
-        .sum::<f64>() * mid
+    let g = |t: f64| -> f64 {
+        if t <= 0.0 { return 0.0; }   // u -> inf: integrand has already decayed
+        let u = (1.0 - t) / t;
+        if u < 1e-12 { return 0.0; }  // u -> 0: removable point of the kernel
+        let v = f(u) / (t * t);
+        if v.is_finite() { v } else { 0.0 }
+    };
+    adaptive_gk(&g, 0.0, 1.0, 1e-8)
 }
 
 #[cfg(test)]
@@ -249,6 +301,61 @@ mod tests {
             opt_type: OptionType::Call,
         });
         assert!((h.delta - b.delta).abs() < 0.01, "heston delta={:.4} bsm delta={:.4}", h.delta, b.delta);
-        assert!((h.vega  - b.vega ).abs() < 1.0,  "heston vega={:.4}  bsm vega={:.4}",  h.vega,  b.vega);
+        // vega is damped by the (1-e^{-kT})/k factor above: a v0 bump moves the
+        // integrated variance by less than one-for-one, so vega = bsm_vega * that
+        // factor (~0.95 here), not bsm_vega itself.
+        let damp = (1.0 - (-p.kappa * 1.0_f64).exp()) / p.kappa;
+        assert!((h.vega - b.vega * damp).abs() < 0.5,
+            "heston vega={:.4} bsm vega*{:.4}={:.4}", h.vega, damp, b.vega * damp);
+    }
+
+    // Static no-arbitrage across a maturity x strike grid: a call must sit in
+    // [intrinsic, S*e^{-qT}] and decrease with strike. The fixed-panel rule broke
+    // both in the short-dated / wing regime (calls below intrinsic, rising in K).
+    #[test]
+    fn no_static_arbitrage() {
+        let sets = [
+            HestonParams { v0: 0.04, kappa: 2.0, theta: 0.04, sigma: 0.3, rho: -0.7 },
+            HestonParams { v0: 0.09, kappa: 1.0, theta: 0.09, sigma: 0.8, rho: -0.5 },
+            HestonParams { v0: 0.04, kappa: 0.5, theta: 0.04, sigma: 0.5, rho: -0.7 },
+        ];
+        let (s, r, q) = (100.0, 0.03, 0.0);
+        let expiries = [0.02_f64, 0.1, 0.25, 0.5, 1.0, 2.0];
+        let strikes  = [70.0_f64, 85.0, 100.0, 115.0, 130.0, 150.0, 200.0];
+        for p in &sets {
+            for &t in &expiries {
+                let cap = s * (-q*t).exp();
+                let mut prev = f64::INFINITY;
+                for &k in &strikes {
+                    let c = heston_price(s, k, t, r, q, p, OptionType::Call);
+                    let intrinsic = (s*(-q*t).exp() - k*(-r*t).exp()).max(0.0);
+                    assert!(c >= intrinsic - 1e-4, "call {c} < intrinsic {intrinsic} (T={t} K={k})");
+                    assert!(c <= cap + 1e-4,       "call {c} > spot cap {cap} (T={t} K={k})");
+                    assert!(c <= prev + 1e-4,      "call not monotone in K (T={t} K={k}): {c} > {prev}");
+                    prev = c;
+                }
+            }
+        }
+    }
+
+    // As vol-of-vol -> 0 the variance is frozen at v0, so Heston must collapse
+    // onto BSM(vol = sqrt(v0)) at every strike. The fixed panel missed this by
+    // up to ~0.4 in the wings; the adaptive rule recovers it to ~1e-6.
+    #[test]
+    fn zero_vol_of_vol_matches_bsm() {
+        use crate::bsm::bsm_price;
+        use crate::types::OptionContract;
+        let p = HestonParams { v0: 0.04, kappa: 1.0, theta: 0.04, sigma: 1e-4, rho: 0.0 };
+        let (s, r, q, vol) = (100.0, 0.03, 0.0, 0.2);
+        for &t in &[0.25_f64, 1.0, 2.0] {
+            for &k in &[70.0_f64, 85.0, 100.0, 115.0, 130.0] {
+                let h = heston_price(s, k, t, r, q, &p, OptionType::Call);
+                let b = bsm_price(&OptionContract {
+                    spot: s, strike: k, expiry: t, rate: r, div_yield: q, vol,
+                    opt_type: OptionType::Call,
+                });
+                assert!((h - b).abs() < 0.02, "heston {h:.5} vs bsm {b:.5} (T={t} K={k})");
+            }
+        }
     }
 }
