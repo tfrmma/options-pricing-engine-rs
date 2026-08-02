@@ -32,7 +32,7 @@ fn price_in_bounds(c: &OptionContract, price: f64) -> bool {
 
 // Brenner-Subrahmanyam ATM approximation, adjusted for moneyness.
 // good enough that Halley finishes in 2 steps most of the time.
-// falls back to bisection if we're way off — rare, but happens on deep wings.
+// falls back to bisection if we're way off, rare, but happens on deep wings.
 fn initial_guess(c: &OptionContract, price: f64) -> Option<f64> {
     let er  = (-c.rate * c.expiry).exp();
     let eq  = (-c.div_yield * c.expiry).exp();
@@ -48,7 +48,7 @@ fn initial_guess(c: &OptionContract, price: f64) -> Option<f64> {
     bisect(c, price)
 }
 
-// last resort — always converges, just not fast
+// last resort, always converges, just not fast
 fn bisect(c: &OptionContract, target: f64) -> Option<f64> {
     let mut lo = 1e-4_f64;
     let mut hi = 10.0_f64;
@@ -74,7 +74,7 @@ fn halley_solve(c: &OptionContract, target: f64, v0: f64) -> Option<f64> {
         v -= err / (vega * denom);
         if v <= 0.0 { v = 1e-8; }
     }
-    // didn't converge cleanly — return best effort if it's close enough
+    // didn't converge cleanly, return best effort if it's close enough
     if (bsm_price(&OptionContract { vol: v, ..*c }) - target).abs() < 1e-6 {
         Some(v)
     } else {
