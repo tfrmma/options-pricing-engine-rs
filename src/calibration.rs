@@ -2,7 +2,7 @@
 // fits (v0, kappa, theta, sigma, rho) to a slice of (contract, iv_market) pairs.
 //
 // why IVs and not prices? prices overweight ITM options by ~10x. fitting in
-// vol space treats a 10d wing the same as an ATM — which is what you want
+// vol space treats a 10d wing the same as an ATM, which is what you want
 // when you care about the shape of the surface, not just the center.
 //
 // LM in a nutshell: Newton with a damping term that makes it behave like
@@ -10,7 +10,7 @@
 // cautious, lambda down = more aggressive. standard Marquardt update rule.
 //
 // Jacobian: FD central differences on each param. analytic would be faster
-// but this isn't on the hot path — calibration runs offline or on surface updates.
+// but this isn't on the hot path, calibration runs offline or on surface updates.
 
 use crate::types::{HestonParams, OptionContract, IvProblem};
 use crate::heston::heston_price;
@@ -46,8 +46,10 @@ pub struct CalibResult {
     pub converged: bool,
 }
 
-// main entry point. pass a reasonable initial guess — ATM vol^2 for v0/theta,
+// main entry point. pass a reasonable initial guess, ATM vol^2 for v0/theta,
 // kappa=1-3, sigma=0.3-0.5, rho=-0.5 to -0.7 is usually fine.
+// TODO: no calibrate_bates. lambda/mu_j/sigma_j would need to go in the
+// param vector and jacobian alongside the Heston 5, haven't needed it yet.
 pub fn calibrate_heston(
     quotes:  &[CalibInput],
     p0:      HestonParams,
@@ -102,7 +104,7 @@ pub fn calibrate_heston(
                 break;
             }
         } else {
-            // bad step — increase damping and retry with same params
+            // bad step, increase damping and retry with same params
             lam = (lam * LM_UP).min(LM_MAX);
             if lam >= LM_MAX { break; }
         }
@@ -117,13 +119,13 @@ pub fn calibrate_heston(
 }
 
 // residual for one option: iv_heston(p) - iv_market.
-// returns 0.0 if heston or iv solver bails — don't let one bad quote blow up the fit.
+// returns 0.0 if heston or iv solver bails, don't let one bad quote blow up the fit.
 fn single_residual(contract: &OptionContract, iv_mkt: f64, p: &HestonParams) -> f64 {
     let px = heston_price(
         contract.spot, contract.strike, contract.expiry,
         contract.rate, contract.div_yield, p, contract.opt_type,
     );
-    // need a contract with a vol field to run the iv solver — use iv_mkt as placeholder
+    // need a contract with a vol field to run the iv solver, use iv_mkt as placeholder
     let c_for_iv = OptionContract { vol: iv_mkt, ..*contract };
     match implied_vol(&IvProblem { contract: c_for_iv, market_price: px }) {
         Some(iv) => iv - iv_mkt,
@@ -182,7 +184,7 @@ fn jtj_and_grad(j: &[Vec<f64>], res: &[f64], quotes: &[CalibInput]) -> ([[f64; 5
 }
 
 // solve (J'J + lam*diag(J'J)) * dp = -grad via Cholesky-ish (just Gaussian
-// elimination — 5x5 system, not worth pulling in a linear algebra crate).
+// elimination, 5x5 system, not worth pulling in a linear algebra crate).
 fn lm_step(jtj: &[[f64; 5]; 5], grad: &[f64; 5], lam: f64) -> [f64; 5] {
     let mut a = *jtj;
     let mut b = *grad;
@@ -230,7 +232,7 @@ fn vec_to_params(v: &[f64; 5]) -> HestonParams {
     HestonParams { v0: v[0], kappa: v[1], theta: v[2], sigma: v[3], rho: v[4] }
 }
 
-// hard bounds — if a step lands outside these, reject it.
+// hard bounds, if a step lands outside these, reject it.
 // loose enough to not interfere with calibration, tight enough to keep params sane.
 fn bounds_ok(p: &HestonParams) -> bool {
     p.v0    > 1e-8 && p.v0    < 5.0  &&
@@ -278,7 +280,7 @@ mod tests {
         let res = calibrate_heston(&quotes, p0);
 
         assert!(res.converged, "calibration did not converge after {} iters", res.iters);
-        assert!(res.rmse < 0.005, "rmse={:.6} — surface fit too poor", res.rmse);
+        assert!(res.rmse < 0.005, "rmse={:.6}, surface fit too poor", res.rmse);
         assert!((res.params.v0    - true_p.v0   ).abs() < 0.005, "v0 off");
         assert!((res.params.rho   - true_p.rho  ).abs() < 0.05,  "rho off");
     }
