@@ -3,10 +3,12 @@
 
 pub mod types;
 pub mod math;
+mod greeks;
 pub mod bsm;
 pub mod iv;
 pub mod heston;
 pub mod bates;
+pub mod ad;
 pub mod local_vol;
 pub mod batch;
 pub mod calibration;
@@ -17,6 +19,7 @@ pub use types::{OptionType, OptionContract, PricingResult, IvProblem,
 pub use bsm::{bsm_price, bsm_price_and_greeks, black76_price_and_greeks};
 pub use iv::implied_vol;
 pub use heston::{heston_price, heston_price_and_greeks};
+pub use ad::heston_greeks_ad;
 pub use bates::{bates_price, bates_price_and_greeks};
 pub use local_vol::{dupire_local_vol, monotone_cubic_interp, check_and_repair_surface,
                      repair_surface_to_clean, SurfaceAudit, SurfaceViolation, ViolationKind};
