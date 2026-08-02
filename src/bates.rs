@@ -1,16 +1,30 @@
 // Bates (1996): Heston + Merton log-normal jumps.
 // CF for Bates = Heston CF * jump CF. that's the whole trick.
-// keep them separate — bolting jumps onto Heston post-integration doesn't work.
+// keep them separate, bolting jumps onto Heston post-integration doesn't work.
 //
-// stable_cf and gk_integrate live in heston.rs — imported directly below.
+// stable_cf and gk_integrate live in heston.rs, imported directly below.
 //
 // Greeks: bump-and-reprice on bates_price. jumps affect vega and vanna so
-// we can't just delegate to heston_price_and_greeks — the bump has to go
+// we can't just delegate to heston_price_and_greeks, the bump has to go
 // through the full Bates pricer.
 
 use num_complex::Complex64;
-use crate::types::{BatesParams, OptionType, PricingResult};
+use crate::types::{BatesParams, HestonParams, OptionType, PricingResult};
 use crate::heston::{stable_cf, gk_integrate};
+use crate::greeks::{BumpPriceable, bump_and_reprice_greeks};
+
+impl BumpPriceable for BatesParams {
+    #[inline]
+    fn price(&self, spot: f64, strike: f64, expiry: f64, rate: f64, div_yield: f64, opt_type: OptionType) -> f64 {
+        bates_price(spot, strike, expiry, rate, div_yield, self, opt_type)
+    }
+    #[inline]
+    fn v0(&self) -> f64 { self.heston.v0 }
+    #[inline]
+    fn with_v0(&self, v0: f64) -> Self {
+        BatesParams { heston: HestonParams { v0, ..self.heston }, ..*self }
+    }
+}
 
 pub fn bates_price(
     spot: f64, strike: f64, expiry: f64,
@@ -29,65 +43,11 @@ pub fn bates_price_and_greeks(
     rate: f64, div_yield: f64,
     params: &BatesParams, opt_type: OptionType,
 ) -> PricingResult {
-    let price = bates_price(spot, strike, expiry, rate, div_yield, params, opt_type);
-
-    let ds = 0.01 * spot;
-    let dv = 0.01;
-    let dr = 1e-4;
-    let dt = 1.0 / 365.0;
-
-    let pu    = bates_price(spot + ds, strike, expiry, rate, div_yield, params, opt_type);
-    let pd    = bates_price(spot - ds, strike, expiry, rate, div_yield, params, opt_type);
-    let delta = (pu - pd) / (2.0 * ds);
-    let gamma = (pu - 2.0*price + pd) / (ds * ds);
-
-    // vega bumps v0 in vol units, same convention as heston_price_and_greeks
-    let v_cur = params.heston.v0.sqrt();
-    let p_vup = params_with_v0(params, (v_cur + dv).powi(2));
-    let p_vdn = params_with_v0(params, (v_cur - dv).max(1e-8).powi(2));
-    let vega  = (bates_price(spot, strike, expiry, rate, div_yield, &p_vup, opt_type)
-               - bates_price(spot, strike, expiry, rate, div_yield, &p_vdn, opt_type))
-              / (2.0 * dv);
-
-    let t_dn  = (expiry - dt).max(1e-6);
-    let theta = (bates_price(spot, strike, t_dn, rate, div_yield, params, opt_type) - price) / dt;
-
-    let rho   = (bates_price(spot, strike, expiry, rate + dr, div_yield, params, opt_type)
-               - bates_price(spot, strike, expiry, rate - dr, div_yield, params, opt_type))
-              / (2.0 * dr);
-
-    let delta_vup = {
-        let pu = bates_price(spot + ds, strike, expiry, rate, div_yield, &p_vup, opt_type);
-        let pd = bates_price(spot - ds, strike, expiry, rate, div_yield, &p_vup, opt_type);
-        (pu - pd) / (2.0 * ds)
-    };
-    let delta_vdn = {
-        let pu = bates_price(spot + ds, strike, expiry, rate, div_yield, &p_vdn, opt_type);
-        let pd = bates_price(spot - ds, strike, expiry, rate, div_yield, &p_vdn, opt_type);
-        (pu - pd) / (2.0 * ds)
-    };
-    let vanna = (delta_vup - delta_vdn) / (2.0 * dv);
-
-    let p_vup2 = params_with_v0(params, (v_cur + 2.0*dv).powi(2));
-    let p_vdn2 = params_with_v0(params, (v_cur - 2.0*dv).max(1e-8).powi(2));
-    let vega_up = (bates_price(spot, strike, expiry, rate, div_yield, &p_vup2, opt_type)
-                 - bates_price(spot, strike, expiry, rate, div_yield, params, opt_type))
-                / (2.0 * dv);
-    let vega_dn = (bates_price(spot, strike, expiry, rate, div_yield, params, opt_type)
-                 - bates_price(spot, strike, expiry, rate, div_yield, &p_vdn2, opt_type))
-                / (2.0 * dv);
-    let volga   = (vega_up - vega_dn) / (2.0 * dv);
-
-    PricingResult { price, delta, gamma, vega, theta, rho, vanna, volga }
-}
-
-#[inline]
-fn params_with_v0(p: &BatesParams, v0: f64) -> BatesParams {
-    BatesParams { heston: crate::types::HestonParams { v0, ..p.heston }, ..*p }
+    bump_and_reprice_greeks(spot, strike, expiry, rate, div_yield, params, opt_type)
 }
 
 fn bates_call(s: f64, k: f64, t: f64, r: f64, q: f64, bp: &BatesParams) -> f64 {
-    // x = ln(S/K) — see heston.rs for the derivation of why this (and not
+    // x = ln(S/K), see heston.rs for the derivation of why this (and not
     // ln(F/K)) plus a positive exponential sign is the correct combination.
     let x  = (s/k).ln();
 
