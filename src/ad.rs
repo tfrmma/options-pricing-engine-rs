@@ -1,7 +1,7 @@
 // forward-mode AD for Heston Greeks.
 //
-// bump-and-reprice needs 14 pricing calls for a full greek set.
-// this does 5 forward passes through the CF — one per param.
+// bump-and-reprice needs 14 pricing calls (28 adaptive GK integrations,
+// P1+P2 each). this does 5 forward passes, 10 integrations total.
 //
 // the trick: Leibniz rule lets us differentiate under the integral.
 //   d(price)/dp = integral of Re[ d(CF(u,p))/dp * kernel(u) ] du
@@ -9,16 +9,20 @@
 // dual part. same GK-15 quadrature, dual arithmetic instead of complex.
 //
 // Dual<f64>: (val, dot) where dot = d(val)/dp for the active param.
-// one pass = one param. 5 params = 5 passes. each pass is cheaper than
-// a full pricing call because there's no extra GK evaluation — just
-// dual arithmetic on top of the CF ops we're already doing.
+// one pass = one param, 5 params = 5 passes.
+//
+// measured on this box (see main.rs::heston_ad_demo): fewer integrations
+// does NOT mean faster wall clock. Complex<Dual> multiply/divide costs more
+// per GK node than Complex64, enough to eat the 28-vs-10 win and then some.
+// use this for exactness (no FD bump-size tuning, no truncation error on
+// vega/vanna), not as a drop-in speed upgrade until someone profiles where
+// the dual arithmetic is bleeding cycles.
 
 use std::ops::{Add, Sub, Mul, Div, Neg, Rem};
 use num_traits::{Zero, One, Num};
 use num_complex::Complex;
 use crate::types::{HestonParams, OptionType, PricingResult};
-use crate::heston::GK_NODES;
-use crate::heston::GK_WEIGHTS;
+use crate::heston::{GK_NODES, GK_WEIGHTS, G7_IDX, G7_WEIGHTS};
 
 // --- Dual number ---
 
@@ -60,7 +64,7 @@ impl Div  for Dual { type Output = Self; fn div(self, r: Self) -> Self {
     Dual { val: self.val / r.val, dot: (self.dot * r.val - self.val * r.dot) / (r.val * r.val) }
 }}
 
-// num_traits impls — required for Complex<Dual> to use num-complex's internal ops.
+// num_traits impls, required for Complex<Dual> to use num-complex's internal ops.
 // without these, CDual * CDual won't compile.
 impl Zero for Dual {
     fn zero() -> Self { Dual::constant(0.0) }
@@ -221,22 +225,58 @@ fn dual_integrand(
     (res.re.val, res.re.dot)
 }
 
-// GK-15 integration returning (integral_val, integral_deriv) simultaneously
-fn gk_integrate_dual<F>(f: F) -> (f64, f64)
-where F: Fn(f64) -> (f64, f64)
-{
-    let upper = 200.0;
-    let mid   = upper / 2.0;
-    let mut sum_val  = 0.0;
-    let mut sum_dot  = 0.0;
-    for (&n, &w) in GK_NODES.iter().zip(GK_WEIGHTS.iter()) {
-        let u = mid + mid * n;
-        if u < 1e-12 { continue; }
-        let (v, d) = f(u);
-        sum_val += w * v;
-        sum_dot += w * d;
+// same adaptive Gauss-Kronrod as heston.rs::adaptive_gk, just carrying a
+// (val, dot) pair through each node instead of a bare f64. this used to be
+// a fixed panel over [0, 200], which is the exact bug heston.rs's adaptive_gk
+// was written to kill (under-resolves short-dated/wing integrands, silently
+// produces arbitrage-violating prices). ad.rs never got the memo when that
+// fix landed. error control still runs on the primal value only, the dual
+// part rides along on whatever subdivision the primal needs.
+fn gk15_panel_dual<F: Fn(f64) -> (f64, f64)>(f: &F, a: f64, b: f64) -> (f64, f64, f64) {
+    let c = 0.5 * (a + b);
+    let h = 0.5 * (b - a);
+    let fv: [(f64, f64); 15] = std::array::from_fn(|i| f(c + h * GK_NODES[i]));
+    let k_val: f64 = (0..15).map(|i| GK_WEIGHTS[i] * fv[i].0).sum();
+    let k_dot: f64 = (0..15).map(|i| GK_WEIGHTS[i] * fv[i].1).sum();
+    let g_val: f64 = (0..7).map(|j| G7_WEIGHTS[j] * fv[G7_IDX[j]].0).sum();
+    (k_val * h, k_dot * h, (k_val - g_val).abs() * h)
+}
+
+fn adaptive_gk_dual<F: Fn(f64) -> (f64, f64)>(f: &F, a: f64, b: f64, tol: f64) -> (f64, f64) {
+    const MAX_PANELS: usize = 200;
+    let (v0, d0, e0) = gk15_panel_dual(f, a, b);
+    // (error, val, dot, a, b) per live panel, same layout as adaptive_gk
+    let mut panels: Vec<(f64, f64, f64, f64, f64)> = vec![(e0, v0, d0, a, b)];
+    let mut total_val = v0;
+    let mut total_dot = d0;
+    let mut err = e0;
+    while err > tol && panels.len() < MAX_PANELS {
+        let w = (0..panels.len()).max_by(|&i, &j| panels[i].0.total_cmp(&panels[j].0)).unwrap();
+        let (ew, vw, dw, aw, bw) = panels.swap_remove(w);
+        let m = 0.5 * (aw + bw);
+        let (vl, dl, el) = gk15_panel_dual(f, aw, m);
+        let (vr, dr, er) = gk15_panel_dual(f, m, bw);
+        total_val += vl + vr - vw;
+        total_dot += dl + dr - dw;
+        err += el + er - ew;
+        panels.push((el, vl, dl, aw, m));
+        panels.push((er, vr, dr, m, bw));
     }
-    (sum_val * mid, sum_dot * mid)
+    (total_val, total_dot)
+}
+
+// [0, inf) -> [0, 1] substitution, u = (1-t)/t, mirrors heston::gk_integrate exactly.
+fn gk_integrate_dual<F: Fn(f64) -> (f64, f64)>(f: F) -> (f64, f64) {
+    let g = |t: f64| -> (f64, f64) {
+        if t <= 0.0 { return (0.0, 0.0); }
+        let u = (1.0 - t) / t;
+        if u < 1e-12 { return (0.0, 0.0); }
+        let (v, d) = f(u);
+        let jac = t * t;
+        let (v, d) = (v / jac, d / jac);
+        if v.is_finite() && d.is_finite() { (v, d) } else { (0.0, 0.0) }
+    };
+    adaptive_gk_dual(&g, 0.0, 1.0, 1e-8)
 }
 
 // one forward pass for a given active param index (0=v0, 1=kappa, 2=theta, 3=sigma, 4=rho).
@@ -273,7 +313,7 @@ fn forward_pass(
     match opt_type {
         OptionType::Call => (call_val, call_dot),
         // put via parity: put = call - S*e^(-qT) + K*e^(-rT)
-        // d(put)/dp = d(call)/dp — parity terms don't depend on Heston params
+        // d(put)/dp = d(call)/dp, parity terms don't depend on Heston params
         OptionType::Put  => (call_val - seq + ker, call_dot),
     }
 }
@@ -377,7 +417,27 @@ mod tests {
         assert!(r.delta < 0.0 && r.delta > -1.0, "put delta={}", r.delta);
     }
 
-    // vega from AD should be close to bump-and-reprice. not identical — AD is exact,
+    // this is the regime that broke silently under the old fixed-panel quadrature:
+    // short expiries and deep wings. price from the AD path has to track
+    // heston_price (adaptive, trusted) everywhere, not just at the ATM 1y point
+    // the other tests happen to use.
+    #[test]
+    fn price_matches_standard_across_wings() {
+        use crate::heston::heston_price;
+        let p = params();
+        let expiries = [0.02_f64, 0.1, 0.5, 1.0, 2.0];
+        let strikes  = [70.0_f64, 85.0, 100.0, 115.0, 130.0];
+        for &t in &expiries {
+            for &k in &strikes {
+                let ad  = heston_greeks_ad(100.0, k, t, 0.05, 0.0, &p, OptionType::Call);
+                let std = heston_price(100.0, k, t, 0.05, 0.0, &p, OptionType::Call);
+                let err = (ad.price - std).abs();
+                assert!(err < 1e-6, "T={t} K={k}: ad={:.8} std={:.8} err={err:.2e}", ad.price, std);
+            }
+        }
+    }
+
+    // vega from AD should be close to bump-and-reprice. not identical, AD is exact,
     // bump has discretization error but should agree to ~1e-3.
     #[test]
     fn vega_close_to_bump() {
