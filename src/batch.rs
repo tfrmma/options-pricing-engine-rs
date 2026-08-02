@@ -14,11 +14,14 @@ pub fn batch_bsm(contracts: &[OptionContract]) -> Vec<PricingResult> {
     contracts.par_iter().map(|c| bsm_price_and_greeks(c)).collect()
 }
 
-// price-only — skip greeks if you just need marks
+// price-only, skip greeks if you just need marks
 pub fn batch_bsm_price(contracts: &[OptionContract]) -> Vec<f64> {
     contracts.par_iter().map(|c| bsm_price(c)).collect()
 }
 
+// TODO: this returns price only, batch_bsm returns full Greeks. add
+// batch_heston_greeks once something downstream actually needs Heston
+// Greeks on a whole chain instead of one strike at a time.
 pub fn batch_heston(contracts: &[OptionContract], params: &HestonParams) -> Vec<f64> {
     contracts.par_iter()
         .map(|c| heston_price(c.spot, c.strike, c.expiry, c.rate, c.div_yield, params, c.opt_type))
