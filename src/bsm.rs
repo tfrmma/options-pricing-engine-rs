@@ -11,7 +11,7 @@ fn d_terms(s: f64, k: f64, t: f64, r: f64, q: f64, v: f64) -> (f64, f64) {
     (d1, d1 - vt)
 }
 
-// compute everything in one pass — exp() calls are expensive, don't redo them
+// compute everything in one pass, exp() calls are expensive, don't redo them
 pub fn bsm_price_and_greeks(c: &OptionContract) -> PricingResult {
     let OptionContract { spot: s, strike: k, expiry: t, rate: r, div_yield: q, vol: v, opt_type } = *c;
 
@@ -44,7 +44,7 @@ fn theta_calc(
     npd1: f64, nd1: f64, nd2: f64,
     vsqt: f64, t: f64, phi: f64,
 ) -> f64 {
-    // per year — caller divides by 365 if they want daily
+    // per year, caller divides by 365 if they want daily
     -seq*npd1*vsqt/(2.0*t) - phi*(q*seq*nd1 - r*ker*nd2)
 }
 
@@ -57,7 +57,6 @@ pub fn bsm_price(c: &OptionContract) -> f64 {
 }
 
 // Black-76: futures/forwards. same math, forward replaces spot, q=0 drops out.
-// TODO: double-check rho sign convention against your booking system
 pub fn black76_price_and_greeks(
     fwd: f64, strike: f64, expiry: f64,
     rate: f64, vol: f64, opt_type: OptionType,
@@ -76,7 +75,10 @@ pub fn black76_price_and_greeks(
     let gamma = er * npd1 / (fwd * vt);
     let vega  = fwd * er * npd1 * expiry.sqrt();
     let theta = er * (-fwd*npd1*vol/(2.0*expiry.sqrt()) - phi*rate*(fwd*nd1 - strike*nd2));
-    let rho   = phi * strike * expiry * er * nd2;
+    // fwd is exogenous here, not spot*e^{(r-q)T}, so the only r-dependence in price
+    // is the discount factor out front. rho = d(price)/dr = -T*price. the old
+    // phi*strike*expiry*er*nd2 was BSM's rho pasted in, it's missing the fwd*nd1 term.
+    let rho   = -expiry * price;
     let vanna = -er * npd1 * d2 / vol;
     let volga = vega * d1 * d2 / vol;
 
@@ -120,5 +122,24 @@ mod tests {
         let b76 = black76_price_and_greeks(fwd, c.strike, c.expiry, c.rate, c.vol, c.opt_type);
         let bsm = bsm_price_and_greeks(&c);
         assert!((b76.price - bsm.price).abs() < 1e-8);
+    }
+
+    // rho used to be BSM's formula copy-pasted in, which is wrong for Black-76
+    // since fwd doesn't carry its own r-dependence here. checked against FD.
+    fn black76_price(fwd: f64, k: f64, t: f64, r: f64, v: f64, ot: OptionType) -> f64 {
+        black76_price_and_greeks(fwd, k, t, r, v, ot).price
+    }
+
+    #[test]
+    fn black76_rho_matches_fd() {
+        let (fwd, k, t, v) = (100.0, 95.0, 0.75, 0.22);
+        for ot in [OptionType::Call, OptionType::Put] {
+            let r = 0.04;
+            let dr = 1e-5;
+            let analytic = black76_price_and_greeks(fwd, k, t, r, v, ot).rho;
+            let fd = (black76_price(fwd, k, t, r+dr, v, ot) - black76_price(fwd, k, t, r-dr, v, ot)) / (2.0*dr);
+            let rel_err = (analytic - fd).abs() / fd.abs().max(1e-8);
+            assert!(rel_err < 1e-5, "{ot:?}: analytic={analytic:.6} fd={fd:.6}");
+        }
     }
 }
