@@ -1,4 +1,4 @@
-// Quick smoke test + timing. Not a unit test — just something you can
+// Quick smoke test + timing. Not a unit test, just something you can
 // run to sanity-check the whole stack after a refactor.
 // Run with: cargo run --release
 
@@ -12,6 +12,7 @@ fn main() {
     black76_demo();
     iv_demo();
     heston_demo();
+    heston_ad_demo();
     bates_demo();
     local_vol_demo();
     batch_bench();
@@ -75,6 +76,28 @@ fn heston_demo() {
     println!();
 }
 
+fn heston_ad_demo() {
+    let params = HestonParams { v0: 0.04, kappa: 2.0, theta: 0.04, sigma: 0.3, rho: -0.7 };
+    let (s, k, t, r, q) = (100.0, 100.0, 1.0, 0.05, 0.0);
+
+    let bump = heston_price_and_greeks(s, k, t, r, q, &params, OptionType::Call);
+    let ad   = heston_greeks_ad(s, k, t, r, q, &params, OptionType::Call);
+    println!("[Heston AD] vega  bump={:.6}  ad={:.6}", bump.vega, ad.vega);
+    println!("[Heston AD] vanna bump={:.6}  ad={:.6}", bump.vanna, ad.vanna);
+
+    let n = 2000;
+    let t0 = Instant::now();
+    for _ in 0..n { std::hint::black_box(heston_price_and_greeks(s, k, t, r, q, &params, OptionType::Call)); }
+    let bump_ms = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
+
+    let t0 = Instant::now();
+    for _ in 0..n { std::hint::black_box(heston_greeks_ad(s, k, t, r, q, &params, OptionType::Call)); }
+    let ad_ms = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
+
+    println!("[Heston AD] per-option: bump={:.4}ms  ad={:.4}ms", bump_ms, ad_ms);
+    println!();
+}
+
 fn bates_demo() {
     let params = BatesParams {
         heston: HestonParams { v0: 0.04, kappa: 2.0, theta: 0.04, sigma: 0.3, rho: -0.7 },
@@ -133,7 +156,3 @@ fn batch_bench() {
     println!("  Heston : {:.2}ms  ({:.0} opts/ms)", heston_ms, chain.len() as f64 / heston_ms);
     println!("  BSM[0]={:.4}  Heston[0]={:.4}", prices[0], heston_prices[0]);
 }
-
-// Quick smoke test + timing. Not a unit test — just something you can
-// run to sanity-check the whole stack after a refactor.
-// Run with: cargo run --release
