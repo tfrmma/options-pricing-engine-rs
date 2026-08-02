@@ -24,7 +24,7 @@ pub struct OptionContract {
     pub opt_type:  OptionType,
 }
 
-// greeks default to 0 — some models compute them, some don't.
+// greeks default to 0, some models compute them, some don't.
 // don't assume they're populated unless you asked for them.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PricingResult {
