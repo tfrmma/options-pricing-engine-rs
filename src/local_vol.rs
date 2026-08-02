@@ -13,7 +13,7 @@
 use crate::types::LocalVolSurface;
 
 // returns local vol (not variance) at grid node (i_k, j_t).
-// returns 0.0 if the result is degenerate — clean your surface if this happens a lot.
+// returns 0.0 if the result is degenerate, clean your surface if this happens a lot.
 pub fn dupire_local_vol(
     surf: &LocalVolSurface,
     spot: f64, rate: f64, div_yield: f64,
@@ -38,45 +38,74 @@ pub fn dupire_local_vol(
     (num / denom).max(0.0).sqrt()
 }
 
-// central diff where we have room, one-sided at edges
+// these three used to FD straight off the raw grid, exactly the noise-amplifying
+// move the module header warns about. now they sample monotone_cubic_interp at
+// node +/- h instead of differencing the raw neighbors. identical to plain
+// central differences on a well-behaved surface, diverges on noisy or kinked
+// data, which is when you actually want the F-B limiter doing the clamping.
+//
+// tradeoff: rebuilds a column/row Vec per call since the surface is stored
+// strided and the spline needs a contiguous slice. fine at surface-update
+// cadence, don't call this per-quote.
+
+fn nearby_gap(xs: &[f64], i: usize) -> f64 {
+    let n = xs.len();
+    let left  = if i > 0     { xs[i] - xs[i-1] } else { f64::INFINITY };
+    let right = if i < n-1   { xs[i+1] - xs[i] } else { f64::INFINITY };
+    left.min(right)
+}
+
+// first derivative of the spline at node i. interior nodes get a symmetric
+// step, boundary nodes get a one-sided step, same as the old raw-grid code,
+// just evaluated through the interpolant instead of the two-point secant.
+// symmetric step at a boundary would poke past xs[0]/xs[n-1] and hit the
+// flat clamp in monotone_cubic_interp, which silently halves the slope.
+fn spline_deriv(xs: &[f64], ys: &[f64], i: usize) -> f64 {
+    let n = xs.len();
+    let x = xs[i];
+    if i == 0 {
+        let h = 0.25 * (xs[1] - xs[0]);
+        (monotone_cubic_interp(xs, ys, x + h) - ys[0]) / h
+    } else if i == n - 1 {
+        let h = 0.25 * (xs[n-1] - xs[n-2]);
+        (ys[n-1] - monotone_cubic_interp(xs, ys, x - h)) / h
+    } else {
+        let h = 0.25 * nearby_gap(xs, i);
+        (monotone_cubic_interp(xs, ys, x + h) - monotone_cubic_interp(xs, ys, x - h)) / (2.0 * h)
+    }
+}
+
 fn dvar_dt(surf: &LocalVolSurface, i_k: usize, j_t: usize) -> f64 {
     let n = surf.expiries.len();
     if n < 2 { return 0.0; }
-    if j_t == 0 {
-        let dt = surf.expiries[1] - surf.expiries[0];
-        (total_var(surf, i_k, 1) - total_var(surf, i_k, 0)) / dt
-    } else if j_t == n-1 {
-        let dt = surf.expiries[n-1] - surf.expiries[n-2];
-        (total_var(surf, i_k, n-1) - total_var(surf, i_k, n-2)) / dt
-    } else {
-        let dt = surf.expiries[j_t+1] - surf.expiries[j_t-1];
-        (total_var(surf, i_k, j_t+1) - total_var(surf, i_k, j_t-1)) / dt
-    }
+    let ys: Vec<f64> = (0..n).map(|j| total_var(surf, i_k, j)).collect();
+    spline_deriv(&surf.expiries, &ys, j_t)
 }
 
 fn dvar_dk(surf: &LocalVolSurface, i_k: usize, j_t: usize) -> f64 {
     let n = surf.strikes.len();
     if n < 2 { return 0.0; }
-    if i_k == 0 {
-        (total_var(surf,1,j_t) - total_var(surf,0,j_t)) / (surf.strikes[1] - surf.strikes[0])
-    } else if i_k == n-1 {
-        (total_var(surf,n-1,j_t) - total_var(surf,n-2,j_t)) / (surf.strikes[n-1] - surf.strikes[n-2])
-    } else {
-        let dk = surf.strikes[i_k+1] - surf.strikes[i_k-1];
-        (total_var(surf,i_k+1,j_t) - total_var(surf,i_k-1,j_t)) / dk
-    }
+    let ys: Vec<f64> = (0..n).map(|i| total_var(surf, i, j_t)).collect();
+    spline_deriv(&surf.strikes, &ys, i_k)
 }
 
 fn d2var_dk2(surf: &LocalVolSurface, i_k: usize, j_t: usize) -> f64 {
     let n = surf.strikes.len();
     if n < 3 { return 0.0; }
-    let i  = i_k.max(1).min(n-2);
-    let dp = surf.strikes[i+1] - surf.strikes[i];
-    let dm = surf.strikes[i]   - surf.strikes[i-1];
-    // denominator for symmetric 3-point FD on non-uniform grid is (dp^2+dm^2)/2.
-    // the original (dp+dm)^2/4 is wrong. dp*dm is also wrong unless dp==dm.
-    (total_var(surf,i+1,j_t) - 2.0*total_var(surf,i,j_t) + total_var(surf,i-1,j_t))
-        / (0.5 * (dp*dp + dm*dm))
+    let ks: &[f64] = &surf.strikes;
+    let ys: Vec<f64> = (0..n).map(|i| total_var(surf, i, j_t)).collect();
+    // same interior clamp as before, curvature at a true edge node isn't
+    // well defined off a 3-point stencil so we borrow the nearest interior one.
+    let i = i_k.max(1).min(n-2);
+    let h = 0.25 * nearby_gap(ks, i);
+    let k = ks[i];
+    // symmetric step through the spline sidesteps the whole nonuniform-grid
+    // denominator question, dp == dm == h by construction so the plain
+    // (y+ - 2y0 + y-)/h^2 form is exact here, no correction factor needed.
+    let yp = monotone_cubic_interp(ks, &ys, k + h);
+    let y0 = monotone_cubic_interp(ks, &ys, k);
+    let ym = monotone_cubic_interp(ks, &ys, k - h);
+    (yp - 2.0*y0 + ym) / (h * h)
 }
 
 #[inline]
@@ -102,11 +131,11 @@ pub fn monotone_cubic_interp(xs: &[f64], ys: &[f64], xq: f64) -> f64 {
     let mi  = slope(xs, ys, i);
     let mi1 = slope(xs, ys, i+1);
 
-    // Fritsch-Butland limiter — prevents overshoot.
+    // Fritsch-Butland limiter, prevents overshoot.
     // condition: alpha^2 + alpha*beta + beta^2 <= 9, where alpha=mi/delta, beta=mi1/delta.
     // if violated, scale both slopes down uniformly so we sit on the boundary.
     // the sqrt formula that was here before is not F-B. it's a made-up norm that
-    // happens to limit *something* but not the right thing — it'll overshoot on
+    // happens to limit *something* but not the right thing, it'll overshoot on
     // asymmetric intervals.
     let delta = (ys[i+1] - ys[i]) / dx;
     let lim = if delta.abs() < 1e-15 { 0.0 } else {
@@ -165,7 +194,7 @@ pub struct SurfaceAudit {
 // butterfly: w(K-) - 2*w(K) + w(K+) >= 0 (convexity in strike space).
 //
 // repair strategy: minimum upward adjustment on the offending node.
-// we don't touch neighbors — repair is conservative and local.
+// we don't touch neighbors, repair is conservative and local.
 // if the surface is badly broken, run multiple passes until clean.
 pub fn check_and_repair_surface(surf: &mut LocalVolSurface) -> SurfaceAudit {
     let mut violations = vec![];
@@ -238,7 +267,7 @@ pub fn repair_surface_to_clean(surf: &mut LocalVolSurface, max_passes: usize) ->
     SurfaceAudit { violations: all_violations, repaired: total_repaired, passes }
 }
 
-// inline helper — avoids borrowing surf mutably while we read
+// inline helper, avoids borrowing surf mutably while we read
 #[inline]
 fn total_var_raw(ivs: &[f64], _nk: usize, nt: usize, i_k: usize, j_t: usize, t: f64) -> f64 {
     let iv = ivs[i_k * nt + j_t];
@@ -268,6 +297,32 @@ mod tests {
         let xs = vec![0.0, 1.0, 2.0, 3.0];
         let ys = vec![0.2; 4];
         assert!((monotone_cubic_interp(&xs, &ys, 1.5) - 0.2).abs() < 1e-10);
+    }
+
+    // proves dvar_dk is actually going through the spline and not just
+    // reproducing the raw secant. column has a one-point total-variance
+    // spike at k=100 (bad quote, fat finger, whatever). plain central diff
+    // at the neighboring node gets dragged toward the spike; the F-B
+    // limiter caps that pull instead of taking it at face value.
+    #[test]
+    fn kink_pulls_raw_diff_but_limiter_damps_it() {
+        let ks = vec![80.0, 90.0, 100.0, 110.0, 120.0];
+        let ts = vec![0.5, 1.0];
+        let w_col = [0.02, 0.02, 0.09, 0.02, 0.02]; // spike at k=100, T=1.0
+        let iv_from_w = |w: f64, t: f64| (w / t).sqrt();
+        let mut ivs = vec![0.0; 10];
+        for i in 0..5 {
+            ivs[i*2]   = iv_from_w(0.01, ts[0]); // flat T=0.5 column
+            ivs[i*2+1] = iv_from_w(w_col[i], ts[1]);
+        }
+        let surf = LocalVolSurface::new(ks.clone(), ts.clone(), ivs);
+
+        let raw_at_1 = (w_col[2] - w_col[0]) / (ks[2] - ks[0]);
+        let smoothed = dvar_dk(&surf, 1, 1);
+
+        assert!(smoothed.abs() < raw_at_1.abs(),
+            "spline should damp the spike's pull: raw={raw_at_1:.6} smoothed={smoothed:.6}");
+        assert!(smoothed > 0.0, "should still point toward the spike, just less aggressively");
     }
 
     #[test]
@@ -302,7 +357,7 @@ mod p0_regression {
         assert!((lv - 0.2).abs() < 0.02, "nonuniform curvature err: lv={lv:.4}");
     }
 
-    // asymmetric interval — this is where the old F-B formula would overshoot.
+    // asymmetric interval, this is where the old F-B formula would overshoot.
     // interpolant must stay bounded between adjacent nodes.
     #[test]
     fn interp_no_overshoot_asymmetric() {
@@ -327,12 +382,12 @@ mod arb_tests {
     use crate::types::LocalVolSurface;
 
     // surface with a calendar spread violation at (i_k=1, j_t=1):
-    // total variance at T=1.0 < T=0.5 — that's negative time value.
+    // total variance at T=1.0 < T=0.5, that's negative time value.
     fn calendar_violation() -> LocalVolSurface {
         let ks = vec![90.0, 100.0, 110.0];
         let ts = vec![0.5, 1.0];
         // ivs indexed [i_k * n_t + j_t]
-        // at k=100: iv(T=0.5)=0.25 => w=0.03125, iv(T=1.0)=0.15 => w=0.0225 — violation
+        // at k=100: iv(T=0.5)=0.25 => w=0.03125, iv(T=1.0)=0.15 => w=0.0225, violation
         let ivs = vec![
             0.20, 0.22,  // k=90:  fine
             0.25, 0.15,  // k=100: T=1.0 has lower total var than T=0.5
@@ -342,11 +397,11 @@ mod arb_tests {
     }
 
     // surface with a butterfly violation at (i_k=1, j_t=0):
-    // middle strike has higher total variance than average of neighbors — negative butterfly.
+    // middle strike has higher total variance than average of neighbors, negative butterfly.
     fn butterfly_violation() -> LocalVolSurface {
         let ks = vec![90.0, 100.0, 110.0];
         let ts = vec![0.5, 1.0];
-        // at T=0.5: w(90)=0.02, w(100)=0.05, w(110)=0.02 — concave, negative butterfly
+        // at T=0.5: w(90)=0.02, w(100)=0.05, w(110)=0.02, concave, negative butterfly
         let ivs = vec![
             (0.02_f64/0.5).sqrt(), (0.03_f64/1.0).sqrt(),  // k=90
             (0.05_f64/0.5).sqrt(), (0.04_f64/1.0).sqrt(),  // k=100: too high at T=0.5
