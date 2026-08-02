@@ -1,6 +1,6 @@
 // Heston (1993) via characteristic function inversion.
 //
-// Using Albrecher et al. (2007) stable formulation — NOT the original.
+// Using Albrecher et al. (2007) stable formulation, NOT the original.
 // Original Heston CF has a branch-cut problem where the complex log
 // jumps discontinuously. quadrature silently returns garbage. fun to debug at 2am.
 //
@@ -12,6 +12,18 @@
 
 use num_complex::Complex64;
 use crate::types::{HestonParams, OptionType, PricingResult};
+use crate::greeks::{BumpPriceable, bump_and_reprice_greeks};
+
+impl BumpPriceable for HestonParams {
+    #[inline]
+    fn price(&self, spot: f64, strike: f64, expiry: f64, rate: f64, div_yield: f64, opt_type: OptionType) -> f64 {
+        heston_price(spot, strike, expiry, rate, div_yield, self, opt_type)
+    }
+    #[inline]
+    fn v0(&self) -> f64 { self.v0 }
+    #[inline]
+    fn with_v0(&self, v0: f64) -> Self { HestonParams { v0, ..*self } }
+}
 
 // standard GK-15 nodes/weights on [-1,1]
 pub const GK_NODES: [f64; 15] = [
@@ -38,8 +50,8 @@ pub const GK_WEIGHTS: [f64; 15] = [
 
 // Gauss-7 weights for the embedded error estimate. The 7 Gauss nodes are the
 // subset of GK_NODES at these indices; |K15 - G7| is the per-panel error.
-const G7_IDX: [usize; 7] = [0, 3, 4, 7, 8, 11, 12];
-const G7_WEIGHTS: [f64; 7] = [
+pub(crate) const G7_IDX: [usize; 7] = [0, 3, 4, 7, 8, 11, 12];
+pub(crate) const G7_WEIGHTS: [f64; 7] = [
     0.4179591836734694,
     0.3818300505051189, 0.3818300505051189,
     0.2797053914892766, 0.2797053914892766,
@@ -54,83 +66,22 @@ pub fn heston_price(
     let call = heston_call(spot, strike, expiry, rate, div_yield, params);
     match opt_type {
         OptionType::Call => call,
-        // put via parity — why integrate twice
+        // put via parity, why integrate twice
         OptionType::Put  => call - spot*(-div_yield*expiry).exp() + strike*(-rate*expiry).exp(),
     }
 }
 
-// bump sizes: dS = 1% spot, dv = 1 vol point, dr = 1bp, dt = 1 calendar day.
-// vanna and volga via double bump — 4 extra pricing calls each, worth it for
-// second-order accuracy.
 pub fn heston_price_and_greeks(
     spot: f64, strike: f64, expiry: f64,
     rate: f64, div_yield: f64,
     params: &HestonParams, opt_type: OptionType,
 ) -> PricingResult {
-    let price = heston_price(spot, strike, expiry, rate, div_yield, params, opt_type);
-
-    let ds  = 0.01 * spot;
-    let dv  = 0.01;
-    let dr  = 1e-4;
-    let dt  = 1.0 / 365.0;
-
-    let pu  = heston_price(spot + ds, strike, expiry, rate, div_yield, params, opt_type);
-    let pd  = heston_price(spot - ds, strike, expiry, rate, div_yield, params, opt_type);
-    let delta = (pu - pd) / (2.0 * ds);
-    let gamma = (pu - 2.0*price + pd) / (ds * ds);
-
-    // vega: bump v0 (initial variance). dv is in vol units so bump v0 by (v+dv)^2 - v^2
-    let v0     = params.v0;
-    let v_cur  = v0.sqrt();
-    let p_vup  = params_with_v0(params, (v_cur + dv).powi(2));
-    let p_vdn  = params_with_v0(params, (v_cur - dv).max(1e-8).powi(2));
-    let vega   = (heston_price(spot, strike, expiry, rate, div_yield, &p_vup, opt_type)
-                - heston_price(spot, strike, expiry, rate, div_yield, &p_vdn, opt_type))
-               / (2.0 * dv);
-
-    // theta: bump expiry down. clamp so we don't go negative.
-    let t_dn  = (expiry - dt).max(1e-6);
-    let theta = (heston_price(spot, strike, t_dn, rate, div_yield, params, opt_type) - price) / dt;
-
-    let rho   = (heston_price(spot, strike, expiry, rate + dr, div_yield, params, opt_type)
-               - heston_price(spot, strike, expiry, rate - dr, div_yield, params, opt_type))
-              / (2.0 * dr);
-
-    // vanna = d(delta)/d(vol). cross bump: (delta at v+dv) - (delta at v-dv)
-    let delta_vup = {
-        let pu = heston_price(spot + ds, strike, expiry, rate, div_yield, &p_vup, opt_type);
-        let pd = heston_price(spot - ds, strike, expiry, rate, div_yield, &p_vup, opt_type);
-        (pu - pd) / (2.0 * ds)
-    };
-    let delta_vdn = {
-        let pu = heston_price(spot + ds, strike, expiry, rate, div_yield, &p_vdn, opt_type);
-        let pd = heston_price(spot - ds, strike, expiry, rate, div_yield, &p_vdn, opt_type);
-        (pu - pd) / (2.0 * ds)
-    };
-    let vanna = (delta_vup - delta_vdn) / (2.0 * dv);
-
-    // volga = d(vega)/d(vol). second derivative of price w.r.t. vol.
-    let p_vup2 = params_with_v0(params, (v_cur + 2.0*dv).powi(2));
-    let p_vdn2 = params_with_v0(params, (v_cur - 2.0*dv).max(1e-8).powi(2));
-    let vega_up = (heston_price(spot, strike, expiry, rate, div_yield, &p_vup2, opt_type)
-                 - heston_price(spot, strike, expiry, rate, div_yield, params, opt_type))
-                / (2.0 * dv);
-    let vega_dn = (heston_price(spot, strike, expiry, rate, div_yield, params, opt_type)
-                 - heston_price(spot, strike, expiry, rate, div_yield, &p_vdn2, opt_type))
-                / (2.0 * dv);
-    let volga   = (vega_up - vega_dn) / (2.0 * dv);
-
-    PricingResult { price, delta, gamma, vega, theta, rho, vanna, volga }
-}
-
-#[inline]
-fn params_with_v0(p: &HestonParams, v0: f64) -> HestonParams {
-    HestonParams { v0, ..*p }
+    bump_and_reprice_greeks(spot, strike, expiry, rate, div_yield, params, opt_type)
 }
 
 fn heston_call(s: f64, k: f64, t: f64, r: f64, q: f64, p: &HestonParams) -> f64 {
     // Gil-Pelaez inversion: C = S*e^(-qT)*P1 - K*e^(-rT)*P2
-    // x = ln(S/K) — log-moneyness (NOT log-forward-moneyness; the rate term
+    // x = ln(S/K), log-moneyness (NOT log-forward-moneyness; the rate term
     // is already carried by the CF itself).
     let x = (s/k).ln();
 
@@ -177,7 +128,7 @@ pub(crate) fn stable_cf(phi: Complex64, t: f64, r: f64, p: &HestonParams) -> Com
 
 // One Gauss-Kronrod panel over [a,b]. Returns (K15 estimate, |K15 - G7| error
 // estimate). Reusing the 15 node values for both rules is the whole point of the
-// Gauss-Kronrod pair — the error estimate is free.
+// Gauss-Kronrod pair, the error estimate is free.
 fn gk15_panel<F: Fn(f64) -> f64>(f: &F, a: f64, b: f64) -> (f64, f64) {
     let c = 0.5 * (a + b);
     let h = 0.5 * (b - a);
@@ -189,7 +140,7 @@ fn gk15_panel<F: Fn(f64) -> f64>(f: &F, a: f64, b: f64) -> (f64, f64) {
 
 // Globally-adaptive Gauss-Kronrod over a finite [a,b] (QUADPACK QAG style):
 // bisect the panel with the largest error estimate until the total estimated
-// error is within tol. This is what GK-15 is designed for — a single fixed
+// error is within tol. This is what GK-15 is designed for, a single fixed
 // panel throws the error estimate away and aliases the oscillation.
 fn adaptive_gk<F: Fn(f64) -> f64>(f: &F, a: f64, b: f64, tol: f64) -> f64 {
     const MAX_PANELS: usize = 200;
@@ -214,7 +165,7 @@ fn adaptive_gk<F: Fn(f64) -> f64>(f: &F, a: f64, b: f64, tol: f64) -> f64 {
 
 // Gil-Pelaez integral over u in [0, inf). The integrand oscillates (frequency
 // set by log-moneyness) and, for short maturity or high vol-of-vol, decays
-// slowly — so a fixed panel under-resolves it, producing arbitrage-violating
+// slowly, so a fixed panel under-resolves it, producing arbitrage-violating
 // prices in the wings. Map [0, inf) -> [0, 1] via u = (1 - t)/t and integrate
 // adaptively; subdivision then resolves the whole frequency range regardless
 // of maturity/moneyness.
@@ -235,7 +186,7 @@ mod tests {
     use crate::types::OptionType;
 
     fn params() -> HestonParams {
-        // 2*kappa*theta=0.16 > sigma^2=0.09 — Feller satisfied
+        // 2*kappa*theta=0.16 > sigma^2=0.09, Feller satisfied
         HestonParams { v0: 0.04, kappa: 2.0, theta: 0.04, sigma: 0.3, rho: -0.7 }
     }
 
