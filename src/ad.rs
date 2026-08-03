@@ -120,24 +120,36 @@ fn cexp(z: CDual) -> CDual {
 }
 
 // sqrt for Complex<Dual>. standard complex sqrt with dual chain rule.
+// sqrt for Complex<Dual>. same cancellation trap as heston.rs's fast_csqrt:
+// the textbook re=sqrt((r+a)/2), im=sign(b)*sqrt((r-a)/2) formula cancels
+// badly when b is tiny relative to a (exactly the sigma->0 regime, see
+// heston.rs for the regression that caught it there first). fix is the same:
+// get the safe component directly, the other one via division instead of
+// subtraction. built entirely out of Dual's own +,-,*,/,sqrt so the chain
+// rule comes along for free instead of being hand-derived and hand-verified
+// twice.
 fn csqrt(z: CDual) -> CDual {
-    // sqrt(a+bi): mod = |z|, arg = atan2(b,a)
-    let a  = z.re.val; let b  = z.im.val;
-    let da = z.re.dot; let db = z.im.dot;
-    let r  = (a*a + b*b).sqrt();
-    if r < 1e-300 { return Complex::new(Dual::constant(0.0), Dual::constant(0.0)); }
-
-    let re_val = ((r + a) / 2.0).sqrt();
-    let im_val = b.signum() * ((r - a) / 2.0).sqrt();
-
-    // chain rule: d(re)/dp, d(im)/dp
-    let dr  = (a*da + b*db) / r;
-    let re_dot = if re_val.abs() > 1e-300 { (dr + da) / (4.0 * re_val) } else { 0.0 };
-    let im_dot = if im_val.abs() > 1e-300 { (dr - da) / (4.0 * im_val) } else { 0.0 };
-    Complex::new(
-        Dual { val: re_val, dot: re_dot },
-        Dual { val: im_val, dot: im_dot },
-    )
+    let a = z.re;
+    let b = z.im;
+    if b.val == 0.0 {
+        return if a.val >= 0.0 {
+            Complex::new(a.sqrt(), b)
+        } else {
+            let m = (-a).sqrt();
+            Complex::new(Dual::constant(0.0), if b.val.is_sign_positive() { m } else { -m })
+        };
+    }
+    let r = (a*a + b*b).sqrt();
+    if a.val >= 0.0 {
+        let re = ((r + a) * Dual::constant(0.5)).sqrt();
+        let im = b / (re * Dual::constant(2.0));
+        Complex::new(re, im)
+    } else {
+        let mag = ((r - a) * Dual::constant(0.5)).sqrt(); // r-a safe here, a<0
+        let im  = if b.val.is_sign_positive() { mag } else { -mag };
+        let re  = b / (im * Dual::constant(2.0));
+        Complex::new(re, im)
+    }
 }
 
 // ln for Complex<Dual>. ln(z) = ln|z| + i*arg(z).
@@ -480,6 +492,7 @@ mod tests {
     use super::*;
     use crate::types::{HestonParams, OptionType};
     use crate::heston::heston_price_and_greeks;
+    use num_complex::Complex64;
 
     fn params() -> HestonParams {
         HestonParams { v0: 0.04, kappa: 2.0, theta: 0.04, sigma: 0.3, rho: -0.7 }
@@ -540,6 +553,264 @@ mod tests {
         assert!(r.delta > 0.0 && r.delta < 1.0, "delta={}", r.delta);
         assert!(r.gamma > 0.0, "gamma={}", r.gamma);
         assert!(r.vega  > 0.0, "vega={}",  r.vega);
+    }
+
+    // --- profiling: where does the dual-arithmetic overhead actually come
+    // from? not run by default (`cargo test` skips #[ignore]), run with:
+    //   cargo test --release -- --ignored --nocapture --test-threads=1 ad::tests::profile
+    // each isolates one layer so the numbers compose: op cost -> transcendental
+    // function cost -> panel cost -> full forward-pass cost. see README's
+    // Known limitations section for what this found.
+    //
+    // IMPORTANT: black_box on the *output* only stops dead-code elimination,
+    // it does NOT stop LLVM from proving a closure-captured input is loop
+    // invariant and hoisting the whole computation out of the loop (or CSE-ing
+    // it to one evaluation). first pass at this benchmark did exactly that,
+    // csqrt/cln came back reading ~0.3ns, i.e. faster than a single cycle,
+    // which is not a real number for a transcendental function. fix: cycle
+    // through a batch of genuinely different inputs so nothing is invariant.
+
+    fn varying_complex(n: usize) -> Vec<Complex64> {
+        (0..n).map(|i| {
+            let f = i as f64;
+            Complex64::new(0.3 + 0.01*f, -0.9 + 0.007*f)
+        }).collect()
+    }
+
+    fn varying_dual(n: usize) -> Vec<CDual> {
+        varying_complex(n).into_iter()
+            .map(|z| Complex::new(Dual { val: z.re, dot: 1.0 }, Dual { val: z.im, dot: 0.0 }))
+            .collect()
+    }
+
+    // n_iters total calls, cycling through `inputs` so no two consecutive
+    // calls see the same value and nothing is provably loop-invariant.
+    fn bench_varying<T, X: Copy, F: Fn(X) -> T>(n_iters: u32, inputs: &[X], f: F) -> f64 {
+        let warmup = (n_iters / 10).max(1000);
+        for i in 0..warmup {
+            std::hint::black_box(f(std::hint::black_box(inputs[i as usize % inputs.len()])));
+        }
+        let t0 = std::time::Instant::now();
+        for i in 0..n_iters {
+            std::hint::black_box(f(std::hint::black_box(inputs[i as usize % inputs.len()])));
+        }
+        t0.elapsed().as_secs_f64() * 1e9 / n_iters as f64 // ns/op
+    }
+
+    #[test]
+    #[ignore]
+    fn profile_op_level() {
+        let cs = varying_complex(64);
+        let ds = varying_dual(64);
+        let n = 4_000_000;
+
+        let t_mul_c = bench_varying(n, &cs, |z| z * Complex64::new(0.4, 1.1));
+        let t_mul_d = bench_varying(n, &ds, |z| z * cd(0.4, 1.1));
+        let t_div_c = bench_varying(n, &cs, |z| z / Complex64::new(0.4, 1.1));
+        let t_div_d = bench_varying(n, &ds, |z| z / cd(0.4, 1.1));
+
+        eprintln!("\n[profile_op_level]  ({} varying inputs, cycled)", cs.len());
+        eprintln!("  Complex64     mul: {t_mul_c:.3} ns/op");
+        eprintln!("  Complex<Dual> mul: {t_mul_d:.3} ns/op  ({:.2}x)", t_mul_d/t_mul_c);
+        eprintln!("  Complex64     div: {t_div_c:.3} ns/op");
+        eprintln!("  Complex<Dual> div: {t_div_d:.3} ns/op  ({:.2}x)", t_div_d/t_div_c);
+    }
+
+    #[test]
+    #[ignore]
+    fn profile_transcendental_level() {
+        use crate::heston::fast_csqrt;
+        let cs = varying_complex(64);
+        let ds = varying_dual(64);
+        let n = 2_000_000;
+
+        let t_exp_c  = bench_varying(n, &cs, |z| z.exp());
+        let t_exp_d  = bench_varying(n, &ds, |z| cexp(z));
+        // sqrt: the fair comparison is against fast_csqrt (same algorithm,
+        // no dual bookkeeping), not the num-complex builtin, that one goes
+        // through to_polar/from_polar (hypot+atan2+sqrt+cos+sin) and isn't
+        // the algorithm either sqrt here actually uses anymore.
+        let t_sqrt_builtin = bench_varying(n, &cs, |z| z.sqrt());
+        let t_sqrt_fast     = bench_varying(n, &cs, |z| fast_csqrt(z));
+        let t_sqrt_d        = bench_varying(n, &ds, |z| csqrt(z));
+        let t_ln_c   = bench_varying(n, &cs, |z| z.ln());
+        let t_ln_d   = bench_varying(n, &ds, |z| cln(z));
+
+        eprintln!("\n[profile_transcendental_level]  ({} varying inputs, cycled)", cs.len());
+        eprintln!("  exp:  Complex64 {t_exp_c:.3} ns, Complex<Dual> {t_exp_d:.3} ns  ({:.2}x)", t_exp_d/t_exp_c);
+        eprintln!("  sqrt: Complex64 builtin (to_polar/from_polar) {t_sqrt_builtin:.3} ns");
+        eprintln!("  sqrt: Complex64 fast_csqrt (what stable_cf actually calls now) {t_sqrt_fast:.3} ns");
+        eprintln!("  sqrt: Complex<Dual> csqrt {t_sqrt_d:.3} ns  ({:.2}x vs fast_csqrt, the fair comparison)", t_sqrt_d/t_sqrt_fast);
+        eprintln!("  ln:   Complex64 {t_ln_c:.3} ns, Complex<Dual> {t_ln_d:.3} ns  ({:.2}x)", t_ln_d/t_ln_c);
+    }
+
+    #[test]
+    #[ignore]
+    fn profile_panel_level() {
+        use crate::heston::stable_cf;
+        // 16 different param sets so the panel computation genuinely differs
+        // call to call, not just the phi node.
+        let param_sets: Vec<HestonParams> = (0..16).map(|i| {
+            let f = i as f64;
+            HestonParams { v0: 0.03 + 0.002*f, kappa: 1.8 + 0.05*f, theta: 0.03 + 0.001*f, sigma: 0.28 + 0.01*f, rho: -0.7 + 0.01*f }
+        }).collect();
+        let dual_sets: Vec<DualParams> = param_sets.iter().map(|p| dual_params(p, 0)).collect();
+        let (t, r) = (1.0, 0.05);
+
+        let n = 100_000;
+        let t_plain = bench_varying(n, &(0..param_sets.len()).collect::<Vec<_>>(), |idx| {
+            let p = &param_sets[idx];
+            let mut acc = Complex64::new(0.0, 0.0);
+            for &node in GK_NODES.iter() {
+                acc += stable_cf(Complex64::new(node, -1.0), t, r, p);
+            }
+            acc
+        });
+        // DualParams isn't Copy (Dual doesn't need to be, but the struct
+        // itself is small so this is fine at 100k reps), index into it instead.
+        let idxs: Vec<usize> = (0..dual_sets.len()).collect();
+        let t_dual = bench_varying(n, &idxs, |idx| {
+            let dp = &dual_sets[idx];
+            let mut acc = Complex::new(Dual::constant(0.0), Dual::constant(0.0));
+            for &node in GK_NODES.iter() {
+                acc = acc + stable_cf_dual(Complex::new(Dual::constant(node), Dual::constant(-1.0)), t, r, dp);
+            }
+            acc
+        });
+
+        eprintln!("\n[profile_panel_level]  (15 CF evals per call, {} varying param sets)", param_sets.len());
+        eprintln!("  plain Complex64:   {t_plain:.0} ns/panel");
+        eprintln!("  Complex<Dual>:     {t_dual:.0} ns/panel  ({:.2}x)", t_dual/t_plain);
+    }
+
+    #[test]
+    #[ignore]
+    fn profile_full_pass_level() {
+        use crate::heston::{heston_price, heston_price_and_greeks};
+        // varying strikes so nothing across calls is provably identical
+        let strikes: Vec<f64> = (0..32).map(|i| 80.0 + i as f64 * 1.5).collect();
+        let p = params();
+        let (s, t, r, q) = (100.0, 1.0, 0.05, 0.0);
+
+        let n = 3_000;
+        let t_single_price = bench_varying(n, &strikes, |k| heston_price(s, k, t, r, q, &p, OptionType::Call));
+        let t_single_pass   = bench_varying(n, &strikes, |k| forward_pass(s, k, t, r, q, &p, OptionType::Call, 0, None));
+        let t_bump_full     = bench_varying(n, &strikes, |k| heston_price_and_greeks(s, k, t, r, q, &p, OptionType::Call));
+        let t_ad_full       = bench_varying(n, &strikes, |k| heston_greeks_ad(s, k, t, r, q, &p, OptionType::Call));
+
+        eprintln!("\n[profile_full_pass_level]  ({} varying strikes)", strikes.len());
+        eprintln!("  single heston_price (2 plain integrations):          {t_single_price:.0} ns");
+        eprintln!("  single forward_pass (2 dual integrations):           {t_single_pass:.0} ns  ({:.2}x per pass)",
+            t_single_pass/t_single_price);
+        eprintln!("  heston_price_and_greeks (14 plain price calls):      {t_bump_full:.0} ns");
+        eprintln!("  heston_greeks_ad (5 dual passes + 4 FD price calls): {t_ad_full:.0} ns  ({:.2}x)",
+            t_ad_full/t_bump_full);
+    }
+
+    // same cancellation trap as heston.rs's fast_csqrt, same fix, same
+    // discipline: sweep concentrated near the axes (where it actually
+    // bites), not just spread evenly around the circle. checks .val against
+    // the real Complex64::sqrt() and .dot against a finite-difference
+    // derivative of the same scalar function, both have to hold.
+    #[test]
+    fn csqrt_matches_builtin_value_and_fd_derivative() {
+        let mags = [1e-6, 1e-3, 0.1, 1.0, 10.0, 100.0, 1e4];
+        let mut angles = vec![];
+        let n = 25;
+        for i in 0..n {
+            angles.push(-std::f64::consts::PI + 2.0 * std::f64::consts::PI * i as f64 / (n - 1) as f64);
+        }
+        for &tiny in &[1e-2, 1e-4, 1e-6, 1e-8, 1e-10] {
+            for &base in &[0.0_f64, std::f64::consts::PI, std::f64::consts::FRAC_PI_2, -std::f64::consts::FRAC_PI_2] {
+                angles.push(base + tiny);
+                angles.push(base - tiny);
+            }
+        }
+
+        let mut checked = 0;
+        let mut worst_val = 0.0_f64;
+        let mut worst_dot = 0.0_f64;
+        for &mag in &mags {
+            for &ang in &angles {
+                let a = mag * ang.cos();
+                let b = mag * ang.sin();
+
+                // differentiate w.r.t. a (the real part), FD reference.
+                // h has to be small relative to THIS point, not a fixed
+                // floor, points near the branch point (|z| small) need a
+                // proportionally tiny step or the FD straddles the
+                // singularity and gives garbage regardless of how correct
+                // the analytic derivative is.
+                let h = (a.abs() + b.abs()).max(1e-300) * 1e-6;
+                let f = |x: f64| Complex64::new(x, b).sqrt();
+                let fd_re = (f(a+h).re - f(a-h).re) / (2.0*h);
+                let fd_im = (f(a+h).im - f(a-h).im) / (2.0*h);
+
+                let z = Complex::new(Dual::active(a), Dual::constant(b));
+                let got = csqrt(z);
+                let expected_val = Complex64::new(a, b).sqrt();
+
+                let val_err = ((got.re.val - expected_val.re).powi(2) + (got.im.val - expected_val.im).powi(2)).sqrt()
+                    / expected_val.norm().max(1e-300);
+                let dot_err = ((got.re.dot - fd_re).powi(2) + (got.im.dot - fd_im).powi(2)).sqrt()
+                    / (fd_re.powi(2) + fd_im.powi(2)).sqrt().max(1e-6);
+
+                worst_val = worst_val.max(val_err);
+                worst_dot = worst_dot.max(dot_err);
+                checked += 1;
+                assert!(val_err < 1e-9,
+                    "csqrt value mismatch at a={a} b={b}: got=({},{}) expected=({},{}) err={val_err:.2e}",
+                    got.re.val, got.im.val, expected_val.re, expected_val.im);
+                assert!(dot_err < 1e-4,
+                    "csqrt derivative mismatch at a={a} b={b}: got=({},{}) fd=({fd_re},{fd_im}) err={dot_err:.2e}",
+                    got.re.dot, got.im.dot);
+            }
+        }
+        assert!(checked > 250, "sweep too small to trust, only checked {checked} points");
+        eprintln!("csqrt_matches_builtin_value_and_fd_derivative: {checked} points, worst val err {worst_val:.2e}, worst dot err {worst_dot:.2e}");
+    }
+
+    // controlled A/B for the fast_csqrt swap itself: same CF formula, only
+    // the sqrt call differs. this is NOT about dual arithmetic, it's the
+    // separate, real finding that fell out of investigating dual overhead,
+    // stable_cf's sqrt was going through num-complex's to_polar/from_polar
+    // path unnecessarily. kept as a local copy here (not in heston.rs) so
+    // this stays a benchmark-only artifact instead of dead production code.
+    fn stable_cf_old_sqrt(phi: Complex64, t: f64, r: f64, p: &HestonParams) -> Complex64 {
+        let i = Complex64::i();
+        let &HestonParams { v0, kappa, theta, sigma, rho } = p;
+        let xi  = kappa - rho * sigma * phi * i;
+        let d   = (xi*xi + sigma*sigma * phi*(phi + i)).sqrt(); // the old, slower call
+        let g   = (xi - d) / (xi + d);
+        let edt = (-d * t).exp();
+        let a   = (g*edt - 1.0) / (g - 1.0);
+        let c  = (kappa*theta / (sigma*sigma)) * ((xi - d)*t - 2.0*a.ln());
+        let dd = v0 * (xi - d) * (1.0 - edt) / (sigma*sigma * (1.0 - g*edt));
+        (r * phi * i * t + c + dd).exp()
+    }
+
+    #[test]
+    #[ignore]
+    fn profile_fast_csqrt_end_to_end() {
+        use crate::heston::{stable_cf, heston_price};
+        let p = params();
+        let strikes: Vec<f64> = (0..32).map(|i| 80.0 + i as f64 * 1.5).collect();
+        let n = 5_000;
+
+        let t_cf_new = bench_varying(n, &strikes, |k| {
+            let phi = Complex64::new(0.5, -1.0);
+            stable_cf(phi, 1.0, 0.05, &HestonParams { v0: p.v0 + k*1e-9, ..p })
+        });
+        let t_cf_old = bench_varying(n, &strikes, |k| {
+            let phi = Complex64::new(0.5, -1.0);
+            stable_cf_old_sqrt(phi, 1.0, 0.05, &HestonParams { v0: p.v0 + k*1e-9, ..p })
+        });
+        let t_price = bench_varying(n, &strikes, |k| heston_price(100.0, k, 1.0, 0.05, 0.0, &p, OptionType::Call));
+
+        eprintln!("\n[profile_fast_csqrt_end_to_end]");
+        eprintln!("  stable_cf, old to_polar/from_polar sqrt: {t_cf_old:.1} ns/call");
+        eprintln!("  stable_cf, fast_csqrt (current):         {t_cf_new:.1} ns/call  ({:.2}x)", t_cf_new/t_cf_old);
+        eprintln!("  full heston_price (adaptive, many stable_cf calls): {t_price:.0} ns");
     }
 
     #[test]
