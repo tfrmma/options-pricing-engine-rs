@@ -7,8 +7,8 @@
 // Integration: adaptive GK-15 (Gauss-7 embedded error estimate + subdivision).
 // if you need it faster, calibrate offline and cache the surface.
 //
-// Greeks: bump-and-reprice. not pretty but correct.
-// AD or complex-step would be faster; add it when it matters.
+// Greeks: bump-and-reprice by default, heston_greeks_ad (ad.rs) gives exact
+// vega/vanna via forward-mode AD but isn't currently faster, see README.
 
 use num_complex::Complex64;
 use crate::types::{HestonParams, OptionType, PricingResult};
@@ -115,7 +115,7 @@ pub(crate) fn stable_cf(phi: Complex64, t: f64, r: f64, p: &HestonParams) -> Com
     let &HestonParams { v0, kappa, theta, sigma, rho } = p;
 
     let xi  = kappa - rho * sigma * phi * i;
-    let d   = (xi*xi + sigma*sigma * phi*(phi + i)).sqrt();
+    let d   = fast_csqrt(xi*xi + sigma*sigma * phi*(phi + i));
     let g   = (xi - d) / (xi + d);
     let edt = (-d * t).exp();
     let a   = (g*edt - 1.0) / (g - 1.0);
@@ -124,6 +124,54 @@ pub(crate) fn stable_cf(phi: Complex64, t: f64, r: f64, p: &HestonParams) -> Com
     let dd = v0 * (xi - d) * (1.0 - edt) / (sigma*sigma * (1.0 - g*edt));
 
     (r * phi * i * t + c + dd).exp()
+}
+
+// num-complex's Complex64::sqrt() general branch goes through to_polar()/
+// from_polar(), i.e. hypot + atan2 + sqrt + cos + sin (verified by reading
+// the crate source, not assumed). stable_cf calls sqrt() once per CF
+// evaluation, tens of millions of times over a calibration or surface
+// update, and the general branch is the common case here, xi^2+sigma^2*
+// phi*(phi+i) is essentially never exactly real or exactly imaginary for
+// real market params.
+//
+// first version of this used the textbook re_out=sqrt((r+a)/2),
+// im_out=sign(b)*sqrt((r-a)/2) formula directly and it LOOKED right, passed
+// a 296-point correctness sweep at 1e-16 error. then zero_vol_of_vol_matches_bsm
+// failed: sigma->0 makes b (the imaginary part going into this sqrt) tiny
+// relative to a, so r-a is the difference of two nearly-equal quantities,
+// catastrophic cancellation, garbage im_out. the sweep didn't catch it because
+// its points were spread across the full circle, not concentrated near the
+// real axis where this actually bites. to_polar/from_polar doesn't have this
+// problem (atan2 of a tiny/large ratio is accurate, no subtraction of
+// comparable magnitudes), that's the price you pay to drop it.
+//
+// fix: compute whichever output component is safe directly (re_out when
+// a>=0, since r+a can't cancel; the imaginary-magnitude when a<0, since
+// r-a can't cancel there either), then get the OTHER component via
+// division (re_out*im_out = b/2 is an exact identity) instead of the
+// subtraction that cancels. standard stable complex sqrt, this is not a
+// novel trick, see e.g. Kahan's note on complex sqrt or any C99 csqrt impl.
+#[inline]
+pub(crate) fn fast_csqrt(z: Complex64) -> Complex64 {
+    let (a, b) = (z.re, z.im);
+    if b == 0.0 {
+        return if a >= 0.0 {
+            Complex64::new(a.sqrt(), b)
+        } else {
+            let m = (-a).sqrt();
+            Complex64::new(0.0, if b.is_sign_positive() { m } else { -m })
+        };
+    }
+    let r = a.hypot(b); // hypot-safe magnitude
+    if a >= 0.0 {
+        let re_out = ((r + a) / 2.0).sqrt();
+        let im_out = b / (2.0 * re_out); // safe: re_out bounded away from 0 when a>=0 and r>0
+        Complex64::new(re_out, im_out)
+    } else {
+        let im_out = ((r - a) / 2.0).sqrt().copysign(b); // safe: r-a can't cancel when a<0
+        let re_out = b / (2.0 * im_out);
+        Complex64::new(re_out, im_out)
+    }
 }
 
 // One Gauss-Kronrod panel over [a,b]. Returns (K15 estimate, |K15 - G7| error
@@ -188,6 +236,74 @@ mod tests {
     fn params() -> HestonParams {
         // 2*kappa*theta=0.16 > sigma^2=0.09, Feller satisfied
         HestonParams { v0: 0.04, kappa: 2.0, theta: 0.04, sigma: 0.3, rho: -0.7 }
+    }
+
+    // fast_csqrt replaced Complex64::sqrt()'s to_polar/from_polar path in
+    // stable_cf, load-bearing for every model in this crate. has to match
+    // the builtin everywhere, not just at a couple of spot-checked points:
+    // all four quadrants, near the negative real axis (the branch cut,
+    // where sqrt is discontinuous), and across magnitudes from 1e-6 to 1e6.
+    //
+    // the near-axis points at very small angles are the important part.
+    // the first version of this test used 37 points evenly spread around
+    // the full circle (~10 degree spacing) and it passed at 1e-16 error,
+    // then the actual pricer failed on sigma->0 because that regime puts a
+    // TINY imaginary part next to a large real part, an angle far finer
+    // than 10 degrees off the real axis, exactly where the naive algebraic
+    // formula cancels catastrophically. a coarse angular sweep cannot catch
+    // a bug that only bites within a fraction of a degree of the axis.
+    #[test]
+    fn fast_csqrt_matches_builtin() {
+        let mags   = [1e-6, 1e-3, 0.1, 1.0, 10.0, 100.0, 1e4, 1e6];
+        let mut angles = vec![];
+        let n = 37;
+        for i in 0..n {
+            angles.push(-std::f64::consts::PI + 2.0 * std::f64::consts::PI * i as f64 / (n - 1) as f64);
+        }
+        // near-axis angles at decreasing scale, both sides of both axes,
+        // this is what actually exercises the cancellation-prone branch
+        for &tiny in &[1e-2, 1e-4, 1e-6, 1e-8, 1e-10, 1e-12] {
+            for &base in &[0.0_f64, std::f64::consts::PI, std::f64::consts::FRAC_PI_2, -std::f64::consts::FRAC_PI_2] {
+                angles.push(base + tiny);
+                angles.push(base - tiny);
+            }
+        }
+
+        let mut worst: f64 = 0.0;
+        let mut checked = 0;
+        for &mag in &mags {
+            for &ang in &angles {
+                let z = Complex64::new(mag * ang.cos(), mag * ang.sin());
+                let expected = z.sqrt();
+                let got      = fast_csqrt(z);
+                let err = (got - expected).norm() / expected.norm().max(1e-300);
+                worst = worst.max(err);
+                checked += 1;
+                assert!(err < 1e-9,
+                    "fast_csqrt mismatch at z={z:?} (mag={mag}, ang={ang:.10}): got={got:?} expected={expected:?} rel_err={err:.2e}");
+            }
+        }
+        // exact real axis, both signs, and exact imaginary axis, both signs
+        for &(re, im) in &[(4.0, 0.0), (-4.0, 0.0), (-4.0, -0.0), (0.0, 4.0), (0.0, -4.0), (0.0, 0.0)] {
+            let z = Complex64::new(re, im);
+            let expected = z.sqrt();
+            let got      = fast_csqrt(z);
+            let err = (got - expected).norm();
+            assert!(err < 1e-12, "fast_csqrt axis mismatch at z={z:?}: got={got:?} expected={expected:?}");
+        }
+        // the actual case that broke: xi ~= kappa (real, rho=0), tiny
+        // sigma^2 perturbation from the jump/vol-of-vol term. reconstructed
+        // from the zero_vol_of_vol_matches_bsm failure, kept as a named
+        // regression point rather than trusting the sweep alone to cover it.
+        {
+            let z = Complex64::new(1.0, 0.0) + Complex64::new(1e-8, 0.0) * Complex64::new(0.5, -1.0) * (Complex64::new(0.5, -1.0) + Complex64::i());
+            let expected = z.sqrt();
+            let got      = fast_csqrt(z);
+            let err = (got - expected).norm() / expected.norm().max(1e-300);
+            assert!(err < 1e-9, "regression point mismatch: z={z:?} got={got:?} expected={expected:?} err={err:.2e}");
+        }
+        assert!(checked > 250, "sweep too small to trust, only checked {checked} points");
+        eprintln!("fast_csqrt_matches_builtin: {checked} swept points + axis + regression point, worst rel err {worst:.2e}");
     }
 
     #[test]
