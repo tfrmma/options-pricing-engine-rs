@@ -182,6 +182,22 @@ fn stable_cf_dual(phi: CDual, t: f64, r: f64, p: &DualParams) -> CDual {
     cexp(c(r * t) * phi * i + cc + dd)
 }
 
+// jump component, mirrors jump_cf in bates.rs exactly. lambda/mu_j/sigma_j
+// are plain constants here, not part of the active-param set (that's still
+// v0/kappa/theta/sigma/rho, indices 0..=4), so this factor's own dot is
+// always zero. Complex<Dual> multiplication already implements the product
+// rule via Dual's Mul impl, so folding this into stable_cf_dual's output
+// via a straight `*` gives the right derivative for free, no extra plumbing.
+fn jump_cf_dual(phi: CDual, t: f64, lambda: f64, mu_j: f64, sigma_j: f64) -> CDual {
+    let i    = cd_i();
+    let c    = |v: f64| Complex::new(Dual::constant(v), Dual::constant(0.0));
+    let comp = (mu_j + 0.5*sigma_j*sigma_j).exp() - 1.0;
+    let jump = cexp(phi*i*c(mu_j) - c(0.5*sigma_j*sigma_j) * phi*phi);
+    cexp(c(lambda*t) * (jump - c(1.0) - i*phi*c(comp)))
+}
+
+type JumpParams = Option<(f64, f64, f64)>; // (lambda, mu_j, sigma_j)
+
 // params where each field is a Dual lets us set one as active at a time
 struct DualParams {
     v0:    Dual,
@@ -205,7 +221,7 @@ fn dual_params(p: &HestonParams, active: usize) -> DualParams {
 // integrand for one GK node. returns (price_contribution, deriv_contribution).
 fn dual_integrand(
     u: f64, x: f64, t: f64, r: f64,
-    dp: &DualParams, is_p1: bool, cf_mi: Option<CDual>,
+    dp: &DualParams, is_p1: bool, cf_mi: Option<CDual>, jump: JumpParams,
 ) -> (f64, f64) {
     let phi: CDual = if is_p1 {
         Complex::new(Dual::constant(u), Dual::constant(-1.0))
@@ -214,6 +230,9 @@ fn dual_integrand(
     };
 
     let mut cf  = stable_cf_dual(phi, t, r, dp);
+    if let Some((lambda, mu_j, sigma_j)) = jump {
+        cf = cf * jump_cf_dual(phi, t, lambda, mu_j, sigma_j);
+    }
     if let Some(norm) = cf_mi {
         cf = cf / norm;
     }
@@ -280,21 +299,28 @@ fn gk_integrate_dual<F: Fn(f64) -> (f64, f64)>(f: F) -> (f64, f64) {
 }
 
 // one forward pass for a given active param index (0=v0, 1=kappa, 2=theta, 3=sigma, 4=rho).
+// jump=None prices Heston, jump=Some(lambda,mu_j,sigma_j) prices Bates through
+// the same 5 Heston-driven params, the CF composes exactly like bates_call
+// does (Heston CF * jump CF, multiplied in before integration).
 // returns (price, dprice/dparam).
 fn forward_pass(
     s: f64, k: f64, t: f64, r: f64, q: f64,
-    p: &HestonParams, opt_type: OptionType, active: usize,
+    p: &HestonParams, opt_type: OptionType, active: usize, jump: JumpParams,
 ) -> (f64, f64) {
     let x  = (s/k).ln();
     let dp = dual_params(p, active);
 
     // CF(-i) normalizer (as a dual, so its derivative w.r.t. the active
-    // param is also propagated into P1).
+    // param is also propagated into P1). includes the jump factor too,
+    // same as bates_call's cf_mi.
     let phi_mi = Complex::new(Dual::constant(0.0), Dual::constant(-1.0));
-    let cf_mi  = stable_cf_dual(phi_mi, t, r, &dp);
+    let mut cf_mi = stable_cf_dual(phi_mi, t, r, &dp);
+    if let Some((lambda, mu_j, sigma_j)) = jump {
+        cf_mi = cf_mi * jump_cf_dual(phi_mi, t, lambda, mu_j, sigma_j);
+    }
 
-    let (i1_val, i1_dot) = gk_integrate_dual(|u| dual_integrand(u, x, t, r, &dp, true, Some(cf_mi)));
-    let (i2_val, i2_dot) = gk_integrate_dual(|u| dual_integrand(u, x, t, r, &dp, false, None));
+    let (i1_val, i1_dot) = gk_integrate_dual(|u| dual_integrand(u, x, t, r, &dp, true, Some(cf_mi), jump));
+    let (i2_val, i2_dot) = gk_integrate_dual(|u| dual_integrand(u, x, t, r, &dp, false, None, jump));
 
     let pi     = std::f64::consts::PI;
     let p1_val = 0.5 + i1_val / pi;
@@ -326,11 +352,11 @@ pub fn heston_greeks_ad(
     rate: f64, div_yield: f64,
     params: &HestonParams, opt_type: OptionType,
 ) -> PricingResult {
-    let (price, dv0)    = forward_pass(spot, strike, expiry, rate, div_yield, params, opt_type, 0);
-    let (_,     dkappa) = forward_pass(spot, strike, expiry, rate, div_yield, params, opt_type, 1);
-    let (_,     dtheta) = forward_pass(spot, strike, expiry, rate, div_yield, params, opt_type, 2);
-    let (_,     dsigma) = forward_pass(spot, strike, expiry, rate, div_yield, params, opt_type, 3);
-    let (_,     drho)   = forward_pass(spot, strike, expiry, rate, div_yield, params, opt_type, 4);
+    let (price, dv0)    = forward_pass(spot, strike, expiry, rate, div_yield, params, opt_type, 0, None);
+    let (_,     dkappa) = forward_pass(spot, strike, expiry, rate, div_yield, params, opt_type, 1, None);
+    let (_,     dtheta) = forward_pass(spot, strike, expiry, rate, div_yield, params, opt_type, 2, None);
+    let (_,     dsigma) = forward_pass(spot, strike, expiry, rate, div_yield, params, opt_type, 3, None);
+    let (_,     drho)   = forward_pass(spot, strike, expiry, rate, div_yield, params, opt_type, 4, None);
 
     // vega = d(price)/d(vol), vol = sqrt(v0) => chain rule
     let vol  = params.v0.sqrt();
@@ -368,16 +394,83 @@ pub fn heston_greeks_ad(
     let vanna = (delta_vup - delta_vdn) / (2.0 * 0.01);
     // volga: FD on vega. second-order AD would be cleaner but overkill for now.
     let vega_up = {
-        let (_, dv0_up) = forward_pass(spot, strike, expiry, rate, div_yield, &p_vup, opt_type, 0);
+        let (_, dv0_up) = forward_pass(spot, strike, expiry, rate, div_yield, &p_vup, opt_type, 0, None);
         dv0_up * 2.0 * (vol + 0.01)
     };
     let vega_dn = {
-        let (_, dv0_dn) = forward_pass(spot, strike, expiry, rate, div_yield, &p_vdn, opt_type, 0);
+        let (_, dv0_dn) = forward_pass(spot, strike, expiry, rate, div_yield, &p_vdn, opt_type, 0, None);
         dv0_dn * 2.0 * (vol - 0.01).max(1e-6)
     };
     let volga = (vega_up - vega_dn) / (2.0 * 0.01);
 
     let _ = (dkappa, dtheta, dsigma, drho); // available for calibration gradient if needed
+
+    PricingResult { price, delta, gamma, vega, theta, rho: rho_greek, vanna, volga }
+}
+
+// same 5 forward passes as heston_greeks_ad, but the CF is Heston * jump,
+// composed before integration same as bates_call does. this gives an exact
+// price and exact d/d(v0,kappa,theta,sigma,rho) through the jump-adjusted
+// CF, not just the Heston part with jumps bolted on after the fact.
+//
+// NOT covered: d(price)/d(lambda), d(price)/d(mu_j), d(price)/d(sigma_j).
+// those params aren't in PricingResult and aren't in the active-param set
+// here, if you need jump-parameter sensitivities for a calibration
+// Jacobian, that's a separate 3-param forward pass someone still has to write.
+pub fn bates_greeks_ad(
+    spot: f64, strike: f64, expiry: f64,
+    rate: f64, div_yield: f64,
+    heston: &HestonParams, lambda: f64, mu_j: f64, sigma_j: f64,
+    opt_type: OptionType,
+) -> PricingResult {
+    let jump: JumpParams = Some((lambda, mu_j, sigma_j));
+    let bp = crate::types::BatesParams { heston: *heston, lambda, mu_j, sigma_j };
+
+    let (price, dv0)    = forward_pass(spot, strike, expiry, rate, div_yield, heston, opt_type, 0, jump);
+    let (_,     dkappa) = forward_pass(spot, strike, expiry, rate, div_yield, heston, opt_type, 1, jump);
+    let (_,     dtheta) = forward_pass(spot, strike, expiry, rate, div_yield, heston, opt_type, 2, jump);
+    let (_,     dsigma) = forward_pass(spot, strike, expiry, rate, div_yield, heston, opt_type, 3, jump);
+    let (_,     drho)   = forward_pass(spot, strike, expiry, rate, div_yield, heston, opt_type, 4, jump);
+
+    let vol  = heston.v0.sqrt();
+    let vega = dv0 * 2.0 * vol;
+
+    let dr        = 1e-4;
+    let p_up      = crate::bates::bates_price(spot, strike, expiry, rate+dr, div_yield, &bp, opt_type);
+    let p_dn      = crate::bates::bates_price(spot, strike, expiry, rate-dr, div_yield, &bp, opt_type);
+    let rho_greek = (p_up - p_dn) / (2.0 * dr);
+
+    let ds    = 0.01 * spot;
+    let p_sup = crate::bates::bates_price(spot+ds, strike, expiry, rate, div_yield, &bp, opt_type);
+    let p_sdn = crate::bates::bates_price(spot-ds, strike, expiry, rate, div_yield, &bp, opt_type);
+    let delta = (p_sup - p_sdn) / (2.0 * ds);
+    let gamma = (p_sup - 2.0*price + p_sdn) / (ds * ds);
+
+    let t_dn  = (expiry - 1.0/365.0).max(1e-6);
+    let theta = (crate::bates::bates_price(spot, strike, t_dn, rate, div_yield, &bp, opt_type) - price)
+              / (1.0/365.0);
+
+    let bp_vup = crate::types::BatesParams { heston: HestonParams { v0: (vol + 0.01).powi(2), ..*heston }, ..bp };
+    let bp_vdn = crate::types::BatesParams { heston: HestonParams { v0: (vol - 0.01).max(1e-6).powi(2), ..*heston }, ..bp };
+    let delta_vup = (crate::bates::bates_price(spot+ds, strike, expiry, rate, div_yield, &bp_vup, opt_type)
+                   - crate::bates::bates_price(spot-ds, strike, expiry, rate, div_yield, &bp_vup, opt_type))
+                  / (2.0 * ds);
+    let delta_vdn = (crate::bates::bates_price(spot+ds, strike, expiry, rate, div_yield, &bp_vdn, opt_type)
+                   - crate::bates::bates_price(spot-ds, strike, expiry, rate, div_yield, &bp_vdn, opt_type))
+                  / (2.0 * ds);
+    let vanna = (delta_vup - delta_vdn) / (2.0 * 0.01);
+
+    let vega_up = {
+        let (_, dv0_up) = forward_pass(spot, strike, expiry, rate, div_yield, &bp_vup.heston, opt_type, 0, jump);
+        dv0_up * 2.0 * (vol + 0.01)
+    };
+    let vega_dn = {
+        let (_, dv0_dn) = forward_pass(spot, strike, expiry, rate, div_yield, &bp_vdn.heston, opt_type, 0, jump);
+        dv0_dn * 2.0 * (vol - 0.01).max(1e-6)
+    };
+    let volga = (vega_up - vega_dn) / (2.0 * 0.01);
+
+    let _ = (dkappa, dtheta, dsigma, drho);
 
     PricingResult { price, delta, gamma, vega, theta, rho: rho_greek, vanna, volga }
 }
@@ -390,6 +483,63 @@ mod tests {
 
     fn params() -> HestonParams {
         HestonParams { v0: 0.04, kappa: 2.0, theta: 0.04, sigma: 0.3, rho: -0.7 }
+    }
+
+    // lambda=0, mu_j=0 collapses the jump CF to exp(0)=1, bates_greeks_ad
+    // should agree with heston_greeks_ad to within quadrature tolerance,
+    // not just "close", the jump factor is genuinely a no-op here.
+    #[test]
+    fn bates_ad_matches_heston_ad_when_jumps_off() {
+        let p = params();
+        let h = heston_greeks_ad(100.0, 100.0, 1.0, 0.05, 0.0, &p, OptionType::Call);
+        let b = bates_greeks_ad(100.0, 100.0, 1.0, 0.05, 0.0, &p, 0.0, 0.0, 1e-8, OptionType::Call);
+        assert!((h.price - b.price).abs() < 1e-6, "price: heston={:.6} bates={:.6}", h.price, b.price);
+        assert!((h.vega  - b.vega ).abs() < 1e-4, "vega:  heston={:.6} bates={:.6}", h.vega,  b.vega);
+    }
+
+    // price has to match the analytic Bates pricer across strikes and
+    // expiries, same regime (short-dated wings) that broke the old
+    // fixed-panel quadrature before it was ported to adaptive.
+    #[test]
+    fn bates_ad_matches_analytic_across_wings() {
+        use crate::bates::bates_price;
+        use crate::types::BatesParams;
+        let heston = params();
+        let (lambda, mu_j, sigma_j) = (0.5, -0.1, 0.15);
+        let bp = BatesParams { heston, lambda, mu_j, sigma_j };
+        let expiries = [0.02_f64, 0.1, 0.5, 1.0, 2.0];
+        let strikes  = [70.0_f64, 85.0, 100.0, 115.0, 130.0];
+        for &t in &expiries {
+            for &k in &strikes {
+                let ad  = bates_greeks_ad(100.0, k, t, 0.05, 0.0, &heston, lambda, mu_j, sigma_j, OptionType::Call);
+                let std = bates_price(100.0, k, t, 0.05, 0.0, &bp, OptionType::Call);
+                let err = (ad.price - std).abs();
+                assert!(err < 1e-6, "T={t} K={k}: ad={:.8} std={:.8} err={err:.2e}", ad.price, std);
+            }
+        }
+    }
+
+    // vega vs bump-and-reprice, same 1% bar as the Heston AD test.
+    #[test]
+    fn bates_ad_vega_close_to_bump() {
+        use crate::bates::bates_price_and_greeks;
+        use crate::types::BatesParams;
+        let heston = params();
+        let (lambda, mu_j, sigma_j) = (0.5, -0.1, 0.15);
+        let bp = BatesParams { heston, lambda, mu_j, sigma_j };
+        let ad  = bates_greeks_ad(100.0, 100.0, 1.0, 0.05, 0.0, &heston, lambda, mu_j, sigma_j, OptionType::Call);
+        let std = bates_price_and_greeks(100.0, 100.0, 1.0, 0.05, 0.0, &bp, OptionType::Call);
+        let err = (ad.vega - std.vega).abs() / std.vega.abs().max(1e-10);
+        assert!(err < 0.01, "vega rel err={err:.4}: ad={:.4} bump={:.4}", ad.vega, std.vega);
+    }
+
+    #[test]
+    fn bates_ad_greeks_signs() {
+        let p = params();
+        let r = bates_greeks_ad(100.0, 100.0, 1.0, 0.05, 0.0, &p, 0.5, -0.1, 0.15, OptionType::Call);
+        assert!(r.delta > 0.0 && r.delta < 1.0, "delta={}", r.delta);
+        assert!(r.gamma > 0.0, "gamma={}", r.gamma);
+        assert!(r.vega  > 0.0, "vega={}",  r.vega);
     }
 
     #[test]
