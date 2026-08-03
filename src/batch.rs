@@ -6,8 +6,8 @@
 use rayon::prelude::*;
 use crate::types::{OptionContract, PricingResult, HestonParams, BatesParams};
 use crate::bsm::{bsm_price_and_greeks, bsm_price};
-use crate::heston::heston_price;
-use crate::bates::bates_price;
+use crate::heston::{heston_price, heston_price_and_greeks};
+use crate::bates::{bates_price, bates_price_and_greeks};
 use crate::iv::implied_vol;
 
 pub fn batch_bsm(contracts: &[OptionContract]) -> Vec<PricingResult> {
@@ -19,18 +19,31 @@ pub fn batch_bsm_price(contracts: &[OptionContract]) -> Vec<f64> {
     contracts.par_iter().map(|c| bsm_price(c)).collect()
 }
 
-// TODO: this returns price only, batch_bsm returns full Greeks. add
-// batch_heston_greeks once something downstream actually needs Heston
-// Greeks on a whole chain instead of one strike at a time.
+// price-only. batch_heston_greeks below if you need the full PricingResult.
 pub fn batch_heston(contracts: &[OptionContract], params: &HestonParams) -> Vec<f64> {
     contracts.par_iter()
         .map(|c| heston_price(c.spot, c.strike, c.expiry, c.rate, c.div_yield, params, c.opt_type))
         .collect()
 }
 
+// full Greeks, one heston_price_and_greeks call per option (14 pricing calls
+// each internally, see greeks.rs), parallelized across the chain. same
+// PricingResult shape as batch_bsm, was missing, now it isn't.
+pub fn batch_heston_greeks(contracts: &[OptionContract], params: &HestonParams) -> Vec<PricingResult> {
+    contracts.par_iter()
+        .map(|c| heston_price_and_greeks(c.spot, c.strike, c.expiry, c.rate, c.div_yield, params, c.opt_type))
+        .collect()
+}
+
 pub fn batch_bates(contracts: &[OptionContract], params: &BatesParams) -> Vec<f64> {
     contracts.par_iter()
         .map(|c| bates_price(c.spot, c.strike, c.expiry, c.rate, c.div_yield, params, c.opt_type))
+        .collect()
+}
+
+pub fn batch_bates_greeks(contracts: &[OptionContract], params: &BatesParams) -> Vec<PricingResult> {
+    contracts.par_iter()
+        .map(|c| bates_price_and_greeks(c.spot, c.strike, c.expiry, c.rate, c.div_yield, params, c.opt_type))
         .collect()
 }
 
@@ -73,6 +86,61 @@ mod tests {
         for (iv, contract) in ivs.iter().zip(c.iter()) {
             let iv = iv.expect("solver bailed");
             assert!((iv - contract.vol).abs() < 1e-6, "got {iv:.8}");
+        }
+    }
+
+    fn heston_params() -> HestonParams {
+        HestonParams { v0: 0.04, kappa: 2.0, theta: 0.04, sigma: 0.3, rho: -0.7 }
+    }
+
+    #[test]
+    fn batch_heston_greeks_matches_scalar() {
+        use crate::heston::heston_price_and_greeks;
+        let c  = chain(15);
+        let p  = heston_params();
+        let out = batch_heston_greeks(&c, &p);
+        assert_eq!(out.len(), c.len());
+        for (contract, r) in c.iter().zip(out.iter()) {
+            let scalar = heston_price_and_greeks(
+                contract.spot, contract.strike, contract.expiry,
+                contract.rate, contract.div_yield, &p, contract.opt_type,
+            );
+            assert!((r.price - scalar.price).abs() < 1e-12, "price mismatch");
+            assert!((r.delta - scalar.delta).abs() < 1e-12, "delta mismatch");
+            assert!((r.vega  - scalar.vega ).abs() < 1e-12, "vega mismatch");
+            assert!((r.vanna - scalar.vanna).abs() < 1e-12, "vanna mismatch");
+        }
+    }
+
+    #[test]
+    fn batch_bates_greeks_matches_scalar() {
+        use crate::bates::bates_price_and_greeks;
+        use crate::types::BatesParams;
+        let c  = chain(15);
+        let bp = BatesParams { heston: heston_params(), lambda: 0.5, mu_j: -0.1, sigma_j: 0.15 };
+        let out = batch_bates_greeks(&c, &bp);
+        assert_eq!(out.len(), c.len());
+        for (contract, r) in c.iter().zip(out.iter()) {
+            let scalar = bates_price_and_greeks(
+                contract.spot, contract.strike, contract.expiry,
+                contract.rate, contract.div_yield, &bp, contract.opt_type,
+            );
+            assert!((r.price - scalar.price).abs() < 1e-12, "price mismatch");
+            assert!((r.delta - scalar.delta).abs() < 1e-12, "delta mismatch");
+            assert!((r.vega  - scalar.vega ).abs() < 1e-12, "vega mismatch");
+        }
+    }
+
+    // batch_heston (price-only) and batch_heston_greeks have to agree on
+    // price too, two different call paths computing the same number.
+    #[test]
+    fn batch_heston_price_matches_batch_heston_greeks() {
+        let c = chain(12);
+        let p = heston_params();
+        let prices = batch_heston(&c, &p);
+        let greeks = batch_heston_greeks(&c, &p);
+        for (px, r) in prices.iter().zip(greeks.iter()) {
+            assert!((px - r.price).abs() < 1e-12);
         }
     }
 }
