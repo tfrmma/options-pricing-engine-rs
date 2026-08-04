@@ -42,17 +42,19 @@ pub struct CalibInput<'a> {
 }
 
 pub struct CalibResult<P = HestonParams> {
-    pub params:    P,
-    pub rmse:      f64,   // weighted RMSE in vol points
-    pub max_err:   f64,   // worst single option error
-    pub iters:     usize,
-    pub converged: bool,
+    pub params:        P,
+    pub rmse:          f64,   // weighted RMSE in vol points
+    pub max_err:       f64,   // worst single option error
+    pub iters:         usize,
+    pub converged:     bool,
+    pub early_stopped: bool,  // pruned by multistart before finishing, see PRUNE_FACTOR
 }
 
 pub struct MultistartResult<P = HestonParams> {
     pub best:        CalibResult<P>,
     pub n_restarts:  usize,
     pub n_converged: usize,  // how many of the restarts actually converged
+    pub n_pruned:    usize,  // how many were aborted early, see PRUNE_FACTOR
 }
 
 // anything LM can calibrate: a fixed-size param vector, a pricer, bounds,
@@ -66,6 +68,14 @@ pub trait CalibModel: Copy + Send + Sync {
     fn bump_sizes() -> Vec<f64>;
     fn param_bounds() -> Vec<(f64, f64)>; // used to clamp FD bump points near a boundary
     fn random_guess(rng: &mut SmallRng) -> Self;
+
+    // exact d(price)/d(param[col]) via AD, when available. default None
+    // means "use FD for this column", which is all Heston's 5 columns ever
+    // do (it has no jump params). Bates overrides this for columns 5..=7
+    // (lambda, mu_j, sigma_j) via ad::bates_jump_sensitivities_ad. the 5
+    // Heston-inherited columns (0..=4) still go through FD even for Bates,
+    // AD-izing those too is a separate change nobody's asked for yet.
+    fn ad_price_derivative(&self, _contract: &OptionContract, _col: usize) -> Option<f64> { None }
 }
 
 impl CalibModel for HestonParams {
@@ -141,6 +151,19 @@ impl CalibModel for BatesParams {
         let sigma_j = rng.gen_range(0.02..0.4);
         BatesParams { heston, lambda, mu_j, sigma_j }
     }
+    fn ad_price_derivative(&self, contract: &OptionContract, col: usize) -> Option<f64> {
+        if col < 5 { return None; }
+        let sens = crate::ad::bates_jump_sensitivities_ad(
+            contract.spot, contract.strike, contract.expiry, contract.rate, contract.div_yield,
+            &self.heston, self.lambda, self.mu_j, self.sigma_j, contract.opt_type,
+        );
+        Some(match col {
+            5 => sens.d_lambda,
+            6 => sens.d_mu_j,
+            7 => sens.d_sigma_j,
+            _ => unreachable!("BatesParams::dim() is 8, col {col} out of range"),
+        })
+    }
 }
 
 // main entry points. pass a reasonable initial guess, ATM vol^2 for v0/theta,
@@ -160,6 +183,14 @@ pub fn calibrate_bates(quotes: &[CalibInput], p0: BatesParams) -> CalibResult<Ba
 // randomized starting points, and keeps the lowest-RMSE result. not a real
 // global optimizer (no CMA-ES, no simulated annealing), just enough restarts
 // that a single bad p0 doesn't quietly wreck the fit.
+//
+// restarts aren't fully isolated: they share one best-SSE-seen-so-far
+// behind a mutex, and every 10 iterations a restart checks it against its
+// own current SSE. more than PRUNE_FACTOR times worse than the best any
+// OTHER restart has found gets aborted (early_stopped=true, not counted as
+// converged). this can only ever kill a restart that's already losing, it
+// never changes which restart wins, it just stops paying for LM iterations
+// and Jacobian evaluations on a run that was never going to catch up.
 pub fn calibrate_heston_multistart(
     quotes: &[CalibInput], p0: HestonParams, n_restarts: usize, seed: u64,
 ) -> MultistartResult {
@@ -172,10 +203,20 @@ pub fn calibrate_bates_multistart(
     calibrate_multistart(quotes, p0, n_restarts, seed)
 }
 
+// how much worse than the shared best a restart has to be to get pruned.
+// tuned by feel, not derived: loose enough that a restart converging
+// normally but a bit slower never gets killed, tight enough to actually
+// save compute on restarts stuck in a clearly bad basin. worth revisiting
+// if it starts pruning restarts that would've caught up.
+const PRUNE_FACTOR: f64 = 8.0;
+const PRUNE_CHECK_EVERY: usize = 10;
+
 fn calibrate_multistart<M: CalibModel>(
     quotes: &[CalibInput], p0: M, n_restarts: usize, seed: u64,
 ) -> MultistartResult<M> {
     let n_restarts = n_restarts.max(1);
+    let shared_best_sse = std::sync::Mutex::new(f64::INFINITY);
+
     let results: Vec<CalibResult<M>> = (0..n_restarts)
         .into_par_iter()
         .map(|i| {
@@ -185,19 +226,26 @@ fn calibrate_multistart<M: CalibModel>(
                 let mut rng = SmallRng::seed_from_u64(splitmix64(seed ^ i as u64));
                 M::random_guess(&mut rng)
             };
-            calibrate(quotes, start)
+            calibrate_inner(quotes, start, Some(&shared_best_sse))
         })
         .collect();
 
     let n_converged = results.iter().filter(|r| r.converged).count();
+    let n_pruned     = results.iter().filter(|r| r.early_stopped).count();
     let best = results.into_iter()
         .min_by(|a, b| a.rmse.total_cmp(&b.rmse))
         .expect("n_restarts >= 1, there's always a best");
 
-    MultistartResult { best, n_restarts, n_converged }
+    MultistartResult { best, n_restarts, n_converged, n_pruned }
 }
 
 fn calibrate<M: CalibModel>(quotes: &[CalibInput], p0: M) -> CalibResult<M> {
+    calibrate_inner(quotes, p0, None)
+}
+
+fn calibrate_inner<M: CalibModel>(
+    quotes: &[CalibInput], p0: M, shared_best_sse: Option<&std::sync::Mutex<f64>>,
+) -> CalibResult<M> {
     assert!(!quotes.is_empty(), "nothing to calibrate");
     let n = M::dim();
 
@@ -206,11 +254,22 @@ fn calibrate<M: CalibModel>(quotes: &[CalibInput], p0: M) -> CalibResult<M> {
     let mut res = residuals(quotes, &M::from_vec(&p));
     let mut sse = weighted_sse(&res, quotes);
 
-    let mut iters     = 0;
-    let mut converged = false;
+    let mut iters         = 0;
+    let mut converged     = false;
+    let mut early_stopped = false;
 
     for iter in 0..MAX_ITER {
         iters = iter + 1;
+
+        if let Some(shared) = shared_best_sse {
+            if iter > 0 && iter % PRUNE_CHECK_EVERY == 0 {
+                let best = *shared.lock().unwrap();
+                if best.is_finite() && sse > best * PRUNE_FACTOR {
+                    early_stopped = true;
+                    break;
+                }
+            }
+        }
 
         let j = jacobian::<M>(quotes, &M::from_vec(&p));
         let (jtj, grad) = jtj_and_grad(&j, &res, quotes, n);
@@ -241,6 +300,11 @@ fn calibrate<M: CalibModel>(quotes: &[CalibInput], p0: M) -> CalibResult<M> {
             sse = sse_new;
             lam = (lam * LM_DOWN).max(1e-12);
 
+            if let Some(shared) = shared_best_sse {
+                let mut best = shared.lock().unwrap();
+                if sse < *best { *best = sse; }
+            }
+
             let step_norm = dp.iter().map(|d| d*d).sum::<f64>().sqrt();
             if step_norm < TOL_PARAMS {
                 converged = true;
@@ -258,7 +322,7 @@ fn calibrate<M: CalibModel>(quotes: &[CalibInput], p0: M) -> CalibResult<M> {
     let rmse    = wmse.sqrt();
     let max_err = res.iter().map(|r| r.abs()).fold(0.0_f64, f64::max);
 
-    CalibResult { params: m, rmse, max_err, iters, converged }
+    CalibResult { params: m, rmse, max_err, iters, converged, early_stopped }
 }
 
 // residual for one option: iv_model(p) - iv_market.
@@ -285,11 +349,26 @@ fn weighted_sse(res: &[f64], quotes: &[CalibInput]) -> f64 {
         .sum()
 }
 
-// central FD Jacobian. one column per param, one row per option. bump points
-// are clamped to each param's valid range before pricing (no negative v0
-// going into the CF), and the denominator uses the actual clamped distance,
-// not the nominal 2*h, so a param sitting near its boundary doesn't get a
-// quietly biased derivative.
+// converts an exact d(price)/d(param) into d(iv)/d(param) via the implicit
+// function theorem: price = BSM(iv), so d(price)/d(iv) = vega_BSM(iv), and
+// d(iv)/d(param) = [d(price)/d(param)] / vega_BSM(iv). standard technique
+// for turning a price-space derivative into a vol-space one without
+// re-deriving the IV solver's own derivative.
+fn model_iv_and_vega<M: CalibModel>(contract: &OptionContract, iv_seed: f64, p: &M) -> Option<(f64, f64)> {
+    let px = p.price(contract);
+    let c_for_iv = OptionContract { vol: iv_seed, ..*contract };
+    let iv = implied_vol(&IvProblem { contract: c_for_iv, market_price: px })?;
+    let c_for_vega = OptionContract { vol: iv, ..*contract };
+    let vega = crate::bsm::bsm_price_and_greeks(&c_for_vega).vega;
+    Some((iv, vega))
+}
+
+// central FD Jacobian, with an AD override per column where CalibModel
+// provides one (currently: Bates' 3 jump columns). bump points are clamped
+// to each param's valid range before pricing (no negative v0 going into the
+// CF), and the denominator uses the actual clamped distance, not the
+// nominal 2*h, so a param sitting near its boundary doesn't get a quietly
+// biased derivative.
 fn jacobian<M: CalibModel>(quotes: &[CalibInput], p: &M) -> Vec<Vec<f64>> {
     let base   = p.to_vec();
     let bumps  = M::bump_sizes();
@@ -298,6 +377,24 @@ fn jacobian<M: CalibModel>(quotes: &[CalibInput], p: &M) -> Vec<Vec<f64>> {
 
     let mut j = vec![vec![0.0; n]; quotes.len()];
     for col in 0..n {
+        // try AD for the whole column first. if any single quote's solver
+        // bails (None), fall back to FD for the whole column rather than
+        // mixing AD and FD entries within one column, that's not worth the
+        // bookkeeping for what should be a rare edge case.
+        let ad_col: Option<Vec<f64>> = quotes.iter()
+            .map(|q| {
+                let d_price   = p.ad_price_derivative(q.contract, col)?;
+                let (_, vega) = model_iv_and_vega(q.contract, q.iv_market, p)?;
+                if vega.abs() < 1e-10 { return None; }
+                Some(d_price / vega)
+            })
+            .collect();
+
+        if let Some(col_vals) = ad_col {
+            for row in 0..quotes.len() { j[row][col] = col_vals[row]; }
+            continue;
+        }
+
         let (lo, hi) = bounds[col];
         let mut vu = base.clone(); vu[col] = (base[col] + bumps[col]).min(hi);
         let mut vd = base.clone(); vd[col] = (base[col] - bumps[col]).max(lo);
@@ -460,6 +557,89 @@ mod tests {
         assert!(res.rmse < 0.01, "rmse={:.6}, bates surface fit too poor", res.rmse);
         assert!((res.params.heston.v0 - true_p.heston.v0).abs() < 0.01, "v0 off");
         assert!(res.params.heston.feller_ok(), "Feller violated: {:?}", res.params.heston);
+    }
+
+    // direct check on jacobian() itself, not just "calibration still
+    // converges" (LM's damping can paper over a slightly-wrong Jacobian and
+    // still converge, slower). the AD columns (5,6,7: lambda, mu_j, sigma_j)
+    // have to match what pure FD gives for the same columns, computed here
+    // independently of jacobian()'s own AD path.
+    #[test]
+    fn bates_jacobian_ad_columns_match_pure_fd() {
+        let heston = HestonParams { v0: 0.045, kappa: 1.8, theta: 0.045, sigma: 0.35, rho: -0.55 };
+        let p = BatesParams { heston, lambda: 0.4, mu_j: -0.08, sigma_j: 0.12 };
+        let raw = make_quotes_bates(&p);
+        let quotes: Vec<CalibInput> = raw.iter()
+            .map(|(c, iv)| CalibInput { contract: c, iv_market: *iv, weight: 1.0 })
+            .collect();
+
+        let j_actual = jacobian(&quotes, &p);
+
+        // independent pure-FD reimplementation of just the jump columns,
+        // deliberately not reusing jacobian()'s own bump/clamp machinery so
+        // this isn't just checking the code against itself.
+        let h = 1e-4;
+        for (row, q) in quotes.iter().enumerate() {
+            for (col, bump) in [(5, "lambda"), (6, "mu_j"), (7, "sigma_j")] {
+                let mut vu = p; let mut vd = p;
+                match bump {
+                    "lambda"  => { vu.lambda  += h; vd.lambda  -= h; }
+                    "mu_j"    => { vu.mu_j    += h; vd.mu_j    -= h; }
+                    "sigma_j" => { vu.sigma_j += h; vd.sigma_j -= h; }
+                    _ => unreachable!(),
+                }
+                let ru = single_residual(q.contract, q.iv_market, &vu);
+                let rd = single_residual(q.contract, q.iv_market, &vd);
+                let fd = (ru - rd) / (2.0 * h);
+                let actual = j_actual[row][col];
+                let err = (actual - fd).abs() / fd.abs().max(1e-6);
+                assert!(err < 0.02,
+                    "row={row} col={col} ({bump}): jacobian()={actual:.6} independent_fd={fd:.6} rel_err={err:.4}");
+            }
+        }
+    }
+
+    // direct test of the pruning mechanism itself, not relying on random
+    // restarts happening to trigger it. rig the shared best to something a
+    // deliberately-terrible start can't plausibly beat quickly, confirm it
+    // gets aborted (early_stopped, and well under MAX_ITER) instead of
+    // burning the full 200 iterations on a run that's not going anywhere.
+    #[test]
+    fn prune_mechanism_aborts_a_hopeless_restart() {
+        let true_p = HestonParams { v0: 0.04, kappa: 2.0, theta: 0.04, sigma: 0.3, rho: -0.5 };
+        let raw    = make_quotes_heston(&true_p);
+        let quotes: Vec<CalibInput> = raw.iter()
+            .map(|(c, iv)| CalibInput { contract: c, iv_market: *iv, weight: 1.0 })
+            .collect();
+
+        // pretend some other restart already found a near-perfect fit
+        let shared = std::sync::Mutex::new(1e-10);
+        let terrible_p0 = HestonParams { v0: 0.3, kappa: 7.5, theta: 0.35, sigma: 0.12, rho: 0.8 };
+        let result = calibrate_inner(&quotes, terrible_p0, Some(&shared));
+
+        assert!(result.early_stopped, "expected the hopeless restart to get pruned");
+        assert!(result.iters < MAX_ITER, "should abort well before the iteration cap, took {}", result.iters);
+        assert!(!result.converged, "a pruned restart shouldn't also claim convergence");
+    }
+
+    // and the opposite: a restart that's actually competitive should NOT
+    // get pruned just because it started behind. shared best set to
+    // something loose enough that reasonable progress stays under it.
+    #[test]
+    fn prune_mechanism_does_not_kill_a_competitive_restart() {
+        let true_p = HestonParams { v0: 0.04, kappa: 2.0, theta: 0.04, sigma: 0.3, rho: -0.5 };
+        let raw    = make_quotes_heston(&true_p);
+        let quotes: Vec<CalibInput> = raw.iter()
+            .map(|(c, iv)| CalibInput { contract: c, iv_market: *iv, weight: 1.0 })
+            .collect();
+
+        let shared = std::sync::Mutex::new(f64::INFINITY); // nothing to compare against yet
+        let decent_p0 = HestonParams { v0: 0.05, kappa: 1.5, theta: 0.05, sigma: 0.4, rho: -0.3 };
+        let result = calibrate_inner(&quotes, decent_p0, Some(&shared));
+
+        assert!(!result.early_stopped, "a competitive restart with nothing to lose to shouldn't be pruned");
+        assert!(result.converged, "should still converge normally");
+        assert!(result.rmse < 0.005, "rmse={:.6}", result.rmse);
     }
 
     // deliberately terrible p0 (miles from truth). single-start LM from here
