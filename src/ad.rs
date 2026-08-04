@@ -200,15 +200,38 @@ fn stable_cf_dual(phi: CDual, t: f64, r: f64, p: &DualParams) -> CDual {
 // always zero. Complex<Dual> multiplication already implements the product
 // rule via Dual's Mul impl, so folding this into stable_cf_dual's output
 // via a straight `*` gives the right derivative for free, no extra plumbing.
-fn jump_cf_dual(phi: CDual, t: f64, lambda: f64, mu_j: f64, sigma_j: f64) -> CDual {
-    let i    = cd_i();
-    let c    = |v: f64| Complex::new(Dual::constant(v), Dual::constant(0.0));
-    let comp = (mu_j + 0.5*sigma_j*sigma_j).exp() - 1.0;
-    let jump = cexp(phi*i*c(mu_j) - c(0.5*sigma_j*sigma_j) * phi*phi);
-    cexp(c(lambda*t) * (jump - c(1.0) - i*phi*c(comp)))
+// jump CF factor, three modes: no jumps at all (Off), jumps present but
+// none of their params are the active derivative (Const, the Heston-active
+// passes use this), or jumps present with ONE of lambda/mu_j/sigma_j
+// carrying the active derivative (Active, used by the jump-parameter
+// sensitivity passes below). one function instead of two near-duplicates
+// so forward_pass/dual_integrand don't need a second copy for jump-param
+// differentiation, they already take a JumpSpec and don't care which
+// variant it is.
+#[derive(Clone, Copy)]
+enum JumpSpec {
+    Off,
+    Const(f64, f64, f64),
+    Active(f64, f64, f64, usize), // lambda, mu_j, sigma_j, 0=lambda active/1=mu_j active/2=sigma_j active
 }
 
-type JumpParams = Option<(f64, f64, f64)>; // (lambda, mu_j, sigma_j)
+fn jump_factor(phi: CDual, t: f64, spec: JumpSpec) -> CDual {
+    let (lambda, mu_j, sigma_j, active) = match spec {
+        JumpSpec::Off => return cd(1.0, 0.0),
+        JumpSpec::Const(l, m, s)      => (l, m, s, usize::MAX),
+        JumpSpec::Active(l, m, s, a)  => (l, m, s, a),
+    };
+    let i   = cd_i();
+    let dl  = if active == 0 { Dual::active(lambda)  } else { Dual::constant(lambda) };
+    let dmj = if active == 1 { Dual::active(mu_j)    } else { Dual::constant(mu_j) };
+    let dsj = if active == 2 { Dual::active(sigma_j) } else { Dual::constant(sigma_j) };
+    let c0 = |d: Dual| Complex::new(d, Dual::constant(0.0));
+
+    let half_sj2 = dsj * dsj * Dual::constant(0.5);
+    let comp = (dmj + half_sj2).exp() - Dual::constant(1.0);
+    let jump = cexp(phi * i * c0(dmj) - c0(half_sj2) * phi * phi);
+    cexp(c0(dl) * c0(Dual::constant(t)) * (jump - c0(Dual::constant(1.0)) - i * phi * c0(comp)))
+}
 
 // params where each field is a Dual lets us set one as active at a time
 struct DualParams {
@@ -233,7 +256,7 @@ fn dual_params(p: &HestonParams, active: usize) -> DualParams {
 // integrand for one GK node. returns (price_contribution, deriv_contribution).
 fn dual_integrand(
     u: f64, x: f64, t: f64, r: f64,
-    dp: &DualParams, is_p1: bool, cf_mi: Option<CDual>, jump: JumpParams,
+    dp: &DualParams, is_p1: bool, cf_mi: Option<CDual>, jump: JumpSpec,
 ) -> (f64, f64) {
     let phi: CDual = if is_p1 {
         Complex::new(Dual::constant(u), Dual::constant(-1.0))
@@ -242,9 +265,7 @@ fn dual_integrand(
     };
 
     let mut cf  = stable_cf_dual(phi, t, r, dp);
-    if let Some((lambda, mu_j, sigma_j)) = jump {
-        cf = cf * jump_cf_dual(phi, t, lambda, mu_j, sigma_j);
-    }
+    cf = cf * jump_factor(phi, t, jump);
     if let Some(norm) = cf_mi {
         cf = cf / norm;
     }
@@ -317,7 +338,7 @@ fn gk_integrate_dual<F: Fn(f64) -> (f64, f64)>(f: F) -> (f64, f64) {
 // returns (price, dprice/dparam).
 fn forward_pass(
     s: f64, k: f64, t: f64, r: f64, q: f64,
-    p: &HestonParams, opt_type: OptionType, active: usize, jump: JumpParams,
+    p: &HestonParams, opt_type: OptionType, active: usize, jump: JumpSpec,
 ) -> (f64, f64) {
     let x  = (s/k).ln();
     let dp = dual_params(p, active);
@@ -326,10 +347,7 @@ fn forward_pass(
     // param is also propagated into P1). includes the jump factor too,
     // same as bates_call's cf_mi.
     let phi_mi = Complex::new(Dual::constant(0.0), Dual::constant(-1.0));
-    let mut cf_mi = stable_cf_dual(phi_mi, t, r, &dp);
-    if let Some((lambda, mu_j, sigma_j)) = jump {
-        cf_mi = cf_mi * jump_cf_dual(phi_mi, t, lambda, mu_j, sigma_j);
-    }
+    let cf_mi = stable_cf_dual(phi_mi, t, r, &dp) * jump_factor(phi_mi, t, jump);
 
     let (i1_val, i1_dot) = gk_integrate_dual(|u| dual_integrand(u, x, t, r, &dp, true, Some(cf_mi), jump));
     let (i2_val, i2_dot) = gk_integrate_dual(|u| dual_integrand(u, x, t, r, &dp, false, None, jump));
@@ -364,11 +382,11 @@ pub fn heston_greeks_ad(
     rate: f64, div_yield: f64,
     params: &HestonParams, opt_type: OptionType,
 ) -> PricingResult {
-    let (price, dv0)    = forward_pass(spot, strike, expiry, rate, div_yield, params, opt_type, 0, None);
-    let (_,     dkappa) = forward_pass(spot, strike, expiry, rate, div_yield, params, opt_type, 1, None);
-    let (_,     dtheta) = forward_pass(spot, strike, expiry, rate, div_yield, params, opt_type, 2, None);
-    let (_,     dsigma) = forward_pass(spot, strike, expiry, rate, div_yield, params, opt_type, 3, None);
-    let (_,     drho)   = forward_pass(spot, strike, expiry, rate, div_yield, params, opt_type, 4, None);
+    let (price, dv0)    = forward_pass(spot, strike, expiry, rate, div_yield, params, opt_type, 0, JumpSpec::Off);
+    let (_,     dkappa) = forward_pass(spot, strike, expiry, rate, div_yield, params, opt_type, 1, JumpSpec::Off);
+    let (_,     dtheta) = forward_pass(spot, strike, expiry, rate, div_yield, params, opt_type, 2, JumpSpec::Off);
+    let (_,     dsigma) = forward_pass(spot, strike, expiry, rate, div_yield, params, opt_type, 3, JumpSpec::Off);
+    let (_,     drho)   = forward_pass(spot, strike, expiry, rate, div_yield, params, opt_type, 4, JumpSpec::Off);
 
     // vega = d(price)/d(vol), vol = sqrt(v0) => chain rule
     let vol  = params.v0.sqrt();
@@ -406,11 +424,11 @@ pub fn heston_greeks_ad(
     let vanna = (delta_vup - delta_vdn) / (2.0 * 0.01);
     // volga: FD on vega. second-order AD would be cleaner but overkill for now.
     let vega_up = {
-        let (_, dv0_up) = forward_pass(spot, strike, expiry, rate, div_yield, &p_vup, opt_type, 0, None);
+        let (_, dv0_up) = forward_pass(spot, strike, expiry, rate, div_yield, &p_vup, opt_type, 0, JumpSpec::Off);
         dv0_up * 2.0 * (vol + 0.01)
     };
     let vega_dn = {
-        let (_, dv0_dn) = forward_pass(spot, strike, expiry, rate, div_yield, &p_vdn, opt_type, 0, None);
+        let (_, dv0_dn) = forward_pass(spot, strike, expiry, rate, div_yield, &p_vdn, opt_type, 0, JumpSpec::Off);
         dv0_dn * 2.0 * (vol - 0.01).max(1e-6)
     };
     let volga = (vega_up - vega_dn) / (2.0 * 0.01);
@@ -435,7 +453,7 @@ pub fn bates_greeks_ad(
     heston: &HestonParams, lambda: f64, mu_j: f64, sigma_j: f64,
     opt_type: OptionType,
 ) -> PricingResult {
-    let jump: JumpParams = Some((lambda, mu_j, sigma_j));
+    let jump = JumpSpec::Const(lambda, mu_j, sigma_j);
     let bp = crate::types::BatesParams { heston: *heston, lambda, mu_j, sigma_j };
 
     let (price, dv0)    = forward_pass(spot, strike, expiry, rate, div_yield, heston, opt_type, 0, jump);
@@ -487,6 +505,34 @@ pub fn bates_greeks_ad(
     PricingResult { price, delta, gamma, vega, theta, rho: rho_greek, vanna, volga }
 }
 
+pub struct BatesJumpSensitivities {
+    pub price:     f64,
+    pub d_lambda:  f64,
+    pub d_mu_j:    f64,
+    pub d_sigma_j: f64,
+}
+
+// d(price)/d(lambda), d(price)/d(mu_j), d(price)/d(sigma_j) via forward-mode
+// AD instead of the finite-difference bumps calibrate_bates's Jacobian used
+// to be stuck with. same forward_pass as heston_greeks_ad/bates_greeks_ad,
+// just called with the Heston side pinned constant (active=usize::MAX,
+// dual_params gives all-constant when nothing matches that index, see
+// dual_params) and a jump parameter carrying the derivative instead
+// (JumpSpec::Active). 3 forward passes, exact, no bump size to tune.
+pub fn bates_jump_sensitivities_ad(
+    spot: f64, strike: f64, expiry: f64,
+    rate: f64, div_yield: f64,
+    heston: &HestonParams, lambda: f64, mu_j: f64, sigma_j: f64,
+    opt_type: OptionType,
+) -> BatesJumpSensitivities {
+    let (price, d_lambda) = forward_pass(spot, strike, expiry, rate, div_yield, heston, opt_type,
+        usize::MAX, JumpSpec::Active(lambda, mu_j, sigma_j, 0));
+    let (_, d_mu_j) = forward_pass(spot, strike, expiry, rate, div_yield, heston, opt_type,
+        usize::MAX, JumpSpec::Active(lambda, mu_j, sigma_j, 1));
+    let (_, d_sigma_j) = forward_pass(spot, strike, expiry, rate, div_yield, heston, opt_type,
+        usize::MAX, JumpSpec::Active(lambda, mu_j, sigma_j, 2));
+    BatesJumpSensitivities { price, d_lambda, d_mu_j, d_sigma_j }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -553,6 +599,72 @@ mod tests {
         assert!(r.delta > 0.0 && r.delta < 1.0, "delta={}", r.delta);
         assert!(r.gamma > 0.0, "gamma={}", r.gamma);
         assert!(r.vega  > 0.0, "vega={}",  r.vega);
+    }
+
+    // price from the jump-sensitivity pass has to match the analytic Bates
+    // price too, it's the same forward_pass machinery, just with a jump
+    // param active instead of a Heston one, price shouldn't care which.
+    #[test]
+    fn jump_sensitivities_price_matches_analytic() {
+        use crate::bates::bates_price;
+        use crate::types::BatesParams;
+        let heston = params();
+        let (lambda, mu_j, sigma_j) = (0.5, -0.1, 0.15);
+        let bp = BatesParams { heston, lambda, mu_j, sigma_j };
+        let sens = bates_jump_sensitivities_ad(100.0, 100.0, 1.0, 0.05, 0.0, &heston, lambda, mu_j, sigma_j, OptionType::Call);
+        let std  = bates_price(100.0, 100.0, 1.0, 0.05, 0.0, &bp, OptionType::Call);
+        assert!((sens.price - std).abs() < 1e-6, "price mismatch: ad={:.8} std={:.8}", sens.price, std);
+    }
+
+    // d(price)/d(lambda), d(price)/d(mu_j), d(price)/d(sigma_j) vs central
+    // FD on bates_price directly (not vs bump-and-reprice's Greeks, those
+    // don't cover jump params at all, this is the only ground truth here).
+    #[test]
+    fn jump_sensitivities_match_fd() {
+        use crate::bates::bates_price;
+        use crate::types::BatesParams;
+        let heston = params();
+        let (lambda, mu_j, sigma_j) = (0.5, -0.1, 0.15);
+        let (s, k, t, r, q) = (100.0, 100.0, 1.0, 0.05, 0.0);
+        let ot = OptionType::Call;
+
+        let price_at = |l: f64, mj: f64, sj: f64| {
+            bates_price(s, k, t, r, q, &BatesParams { heston, lambda: l, mu_j: mj, sigma_j: sj }, ot)
+        };
+
+        let sens = bates_jump_sensitivities_ad(s, k, t, r, q, &heston, lambda, mu_j, sigma_j, ot);
+
+        let h_l  = 1e-5;
+        let fd_l = (price_at(lambda+h_l, mu_j, sigma_j) - price_at(lambda-h_l, mu_j, sigma_j)) / (2.0*h_l);
+        let h_mj  = 1e-5;
+        let fd_mj = (price_at(lambda, mu_j+h_mj, sigma_j) - price_at(lambda, mu_j-h_mj, sigma_j)) / (2.0*h_mj);
+        let h_sj  = 1e-5;
+        let fd_sj = (price_at(lambda, mu_j, sigma_j+h_sj) - price_at(lambda, mu_j, sigma_j-h_sj)) / (2.0*h_sj);
+
+        let rel = |a: f64, b: f64| (a - b).abs() / b.abs().max(1e-8);
+        assert!(rel(sens.d_lambda, fd_l) < 1e-3,
+            "d_lambda: ad={:.8} fd={:.8} rel_err={:.2e}", sens.d_lambda, fd_l, rel(sens.d_lambda, fd_l));
+        assert!(rel(sens.d_mu_j, fd_mj) < 1e-3,
+            "d_mu_j: ad={:.8} fd={:.8} rel_err={:.2e}", sens.d_mu_j, fd_mj, rel(sens.d_mu_j, fd_mj));
+        assert!(rel(sens.d_sigma_j, fd_sj) < 1e-3,
+            "d_sigma_j: ad={:.8} fd={:.8} rel_err={:.2e}", sens.d_sigma_j, fd_sj, rel(sens.d_sigma_j, fd_sj));
+    }
+
+    // NOT the naive intuition (a less-negative expected jump should raise
+    // an ATM call, right?). wrong: raising mu_j also raises the risk-neutral
+    // drift compensator k_bar = exp(mu_j+0.5*sigma_j^2)-1, and the drift
+    // term is -lambda*k_bar, so a bigger k_bar pulls the drift DOWN harder
+    // to keep the discounted process a martingale. for this param set that
+    // compensator effect dominates the direct jump-size effect, net d_mu_j
+    // is negative. caught by jump_sensitivities_match_fd first, this test
+    // exists so the sign doesn't quietly flip back to "intuitive but wrong"
+    // in a future edit without a test noticing.
+    #[test]
+    fn jump_sensitivities_signs_are_sane() {
+        let heston = params();
+        let sens = bates_jump_sensitivities_ad(100.0, 100.0, 1.0, 0.05, 0.0, &heston, 0.5, -0.1, 0.15, OptionType::Call);
+        assert!(sens.d_mu_j < 0.0,
+            "expected the drift-compensator effect to dominate here, d_mu_j={}", sens.d_mu_j);
     }
 
     // --- profiling: where does the dual-arithmetic overhead actually come
@@ -694,7 +806,7 @@ mod tests {
 
         let n = 3_000;
         let t_single_price = bench_varying(n, &strikes, |k| heston_price(s, k, t, r, q, &p, OptionType::Call));
-        let t_single_pass   = bench_varying(n, &strikes, |k| forward_pass(s, k, t, r, q, &p, OptionType::Call, 0, None));
+        let t_single_pass   = bench_varying(n, &strikes, |k| forward_pass(s, k, t, r, q, &p, OptionType::Call, 0, JumpSpec::Off));
         let t_bump_full     = bench_varying(n, &strikes, |k| heston_price_and_greeks(s, k, t, r, q, &p, OptionType::Call));
         let t_ad_full       = bench_varying(n, &strikes, |k| heston_greeks_ad(s, k, t, r, q, &p, OptionType::Call));
 
