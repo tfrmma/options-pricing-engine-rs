@@ -1,6 +1,6 @@
 # options-pricing-engine-rs
 
-A Rust options pricing library covering Black-Scholes-Merton, Black-76, Heston (1993), Bates (1996), and Dupire local volatility, with full analytic Greeks where closed forms exist, a Halley-iteration implied vol solver, Levenberg-Marquardt calibration (single-start and multistart) for both Heston and Bates, no-arbitrage surface repair, and a Monte Carlo engine for path-dependent payoffs. Built for a vol surface update cycle, not a scripting exercise.
+A Rust options pricing library covering Black-Scholes-Merton, Black-76, Heston (1993), Bates (1996), and Dupire local volatility, with full analytic Greeks where closed forms exist, a Halley-iteration implied vol solver, Levenberg-Marquardt calibration (single-start, multistart, and differential-evolution global search) for both Heston and Bates, no-arbitrage surface repair, and a Monte Carlo engine (full truncation Euler or Andersen QE) for path-dependent payoffs. Built for a vol surface update cycle, not a scripting exercise.
 
 License: MIT. See [LICENSE](LICENSE).
 
@@ -25,7 +25,7 @@ License: MIT. See [LICENSE](LICENSE).
 | Heston (1993) | Albrecher et al. (2007) stable characteristic function, adaptive Gauss-Kronrod-15 quadrature | Bump-and-reprice (`heston_price_and_greeks`), or forward-mode automatic differentiation (`heston_greeks_ad`) |
 | Bates (1996) | Heston CF × Merton (1976) log-normal jump CF | Bump-and-reprice (`bates_price_and_greeks`), or forward-mode AD (`bates_greeks_ad`) |
 | Local Vol (Dupire 1994) | Fritsch-Butland monotone cubic spline, differentiated through the spline, not the raw grid | Numerical (local vol surface) |
-| Monte Carlo (Heston/Bates) | Full truncation Euler, exact per-step Poisson jump counts, antithetic variates | N/A, path-dependent payoffs only (European, Asian, up-and-out barrier) |
+| Monte Carlo (Heston/Bates) | Full truncation Euler (default) or Andersen (2008) QE, exact per-step Poisson jump counts, antithetic variates | N/A, path-dependent payoffs only (European, Asian, up-and-out barrier) |
 
 All five analytic models share the same `OptionContract`/`PricingResult` conventions where applicable, so switching models in a caller doesn't mean rewriting the call site.
 
@@ -41,15 +41,19 @@ All five analytic models share the same `OptionContract`/`PricingResult` convent
 
 **Surface repair.** `check_and_repair_surface` is multi-pass: it loops fixing calendar-spread and butterfly violations until the surface is clean or a pass cap is hit. Fixing one violation can create another next to it (bumping an IV to kill a calendar violation can turn a previously-fine butterfly into a violation), so a single pass is not sufficient on a surface with more than one problem.
 
+**Monte Carlo.** `mc_heston`/`mc_bates` default to full truncation Euler (Lord, Koekkoek, van Dijk 2010) for the variance process, correlated via the standard two-normal construction. `McConfig::scheme = VarianceScheme::QuadraticExponential` switches to Andersen's (2008) QE scheme: samples v(t+Δ) from a moment-matched distribution (quadratic-in-normal when ψ≤1.5, an exponential/point-mass mixture above) instead of discretizing and truncating the CIR SDE, and prices using his equation (33) for the log-price update (K0-K4 coefficients, central discretization γ1=γ2=0.5), verified against the primary source PDF, not a secondary writeup. The price innovation in (33) uses an independent normal, correlation with V is already analytic in K1/K2, reusing Euler's rho-correlated shock there was the bug in the first version of this, it gave a *worse* price than plain Euler (off by 6.2 vs analytic, Euler was off by 1.8) until fixed against the actual paper. Measured, not assumed: in a badly Feller-violating case (2κθ=0.4 ≪ σ²=1.44) with a coarse 8-step/year grid, QE cuts the bias against the analytic price roughly 20x versus Euler (`qe_reduces_bias_in_feller_violating_regime`). Bates jumps use an exact per-step Poisson draw (Knuth's algorithm), not the "coin flip with probability λdt" shortcut that silently drops the probability of two or more jumps landing in the same step. Parallelized over path chunks via rayon, with a `splitmix64`-hashed seed per chunk so parallel runs are reproducible and statistically independent. Use this for path-dependent payoffs the CF-inversion pricers can't touch (Asian averages, barriers), not for vanillas, `heston_price`/`bates_price` are exact and far cheaper for those.
+
 **Automatic differentiation.** `heston_greeks_ad` and `bates_greeks_ad` propagate dual numbers (`Dual<f64>`, `Complex<Dual>`) through the characteristic function and integrate the derivative alongside the value via the Leibniz rule, giving exact vega/vanna without a finite-difference bump size to tune. The Bates version composes the Heston CF and the Merton jump CF *before* differentiating (same order `bates_call` uses), so price and the five Heston-driven Greeks are exact through the jump-adjusted CF. Jump-parameter sensitivities (d/dλ, d/dμⱼ, d/dσⱼ) are a separate function, `ad::bates_jump_sensitivities_ad`, same `forward_pass` machinery with the Heston side pinned constant and a jump parameter carrying the active derivative instead, it's what `calibrate_bates`'s Jacobian uses for its jump columns now instead of FD.
+
+`heston_greeks_ad5` is a second, experimental AD path: `Dual5` carries all 5 Heston-parameter tangent directions at once (`dot: [f64; 5]` instead of `f64`) instead of running 5 separate scalar-`Dual` passes, so the CF's *value* gets computed once instead of five times redundantly. Measured (`profile_dual5_vs_five_scalar_passes`, `#[ignore]`d, same methodology as the other profile tests): the joint pass is a real **~3x faster** than 5 scalar passes at the integration level (211µs vs 623µs on this box). But `heston_greeks_ad`/`ad5` spend most of their wall-clock time in the FD-bumped delta/gamma/theta/rho/vanna/volga, identical between both versions, so the win at the full-function level is a much more modest ~6%, and `heston_greeks_ad5` is still slower than bump-and-reprice overall. The 3x is real and would matter if delta/gamma/rho/vanna/volga also moved onto AD (a further, larger `Dual5`-style tangent space covering spot and rate too), that's the natural next step this result points to, not implemented here.
 
 Profiled properly (see `ad::tests::profile_*`, `#[ignore]`d, run with `cargo test --release -- --ignored --nocapture --test-threads=1 ad::tests::profile`), not guessed at: `Complex<Dual>` multiply is ~5.5x a plain `Complex64` multiply, divide is ~11x, both measured with varying inputs cycled through the benchmark so LLVM can't hoist a closure-captured constant out of the loop and report a fake sub-nanosecond number (the first version of this benchmark did exactly that for `sqrt`/`ln`, caught by the results being physically impossible, not by inspection). But `exp` is only ~1.3x and `ln` ~1.1x, dual bookkeeping for those reuses the already-computed value via the standard AD reuse trick instead of redoing the whole computation twice. A full CF evaluation is dominated by the cheap transcendentals, not by raw multiply/divide count, so the aggregate overhead lands around 1.4-1.5x per GK panel and per full pricing pass, nowhere near the 11x the division number alone would suggest. That 1.4-1.5x is why `heston_greeks_ad`/`bates_greeks_ad` are exact but not currently faster wall-clock than bump-and-reprice despite doing fewer integrations (10 vs 28), see [Performance](#performance).
 
 **Calibration.** `calibrate_heston`/`calibrate_bates` run Levenberg-Marquardt in implied-vol space, not price space. Fitting IV directly weights a 10-delta wing the same as an ATM quote; fitting price would overweight ITM options by roughly an order of magnitude relative to their information content about the smile. Both share one generic LM engine (`CalibModel` trait, Heston is a 5-parameter instance, Bates is 8) instead of two near-identical copies of the damping/Jacobian/Gauss-elimination machinery. Bates' 3 jump columns (λ, μⱼ, σⱼ) use exact forward-mode AD (`ad::bates_jump_sensitivities_ad`) converted from price-space to vol-space via `d(iv)/d(param) = [d(price)/d(param)] / vega_BSM(iv)`, the standard implicit-function-theorem trick for turning a price derivative into a vol derivative without re-deriving the IV solver. The 5 Heston-inherited columns still use FD, extending those to AD too is a separate change, `CalibModel::ad_price_derivative` defaults to `None` (FD) and only `BatesParams` overrides it, for columns 5..=7.
 
-`calibrate_heston_multistart`/`calibrate_bates_multistart` run several LM fits in parallel from randomized starting points (rayon, one thread per restart) and keep the best, a bad single initial guess converging to a bad local minimum no longer means a silently bad fit. Restarts aren't fully isolated: they share one best-SSE-seen-so-far behind a mutex, checked every 10 iterations, and a restart running more than 8x worse than the best any other restart has found gets aborted instead of burning its full iteration budget. This can only kill a restart that's already losing, never changes which restart wins, it just stops paying for LM steps and AD/FD Jacobian evaluations on a run that was never catching up. Still a local method under the hood, not CMA-ES or simulated annealing, more restarts help but don't guarantee the global optimum.
+`calibrate_heston_multistart`/`calibrate_bates_multistart` run several LM fits in parallel from randomized starting points (rayon, one thread per restart) and keep the best, a bad single initial guess converging to a bad local minimum no longer means a silently bad fit. Restarts aren't fully isolated: they share one best-SSE-seen-so-far behind a mutex, checked every 10 iterations, and a restart running more than 8x worse than the best any other restart has found gets aborted instead of burning its full iteration budget. This can only kill a restart that's already losing, never changes which restart wins.
 
-**Monte Carlo.** `mc_heston`/`mc_bates` simulate paths under full truncation Euler (Lord, Koekkoek, van Dijk 2010) for the variance process, correlated via the standard Cholesky-free two-normal construction. Bates jumps use an exact per-step Poisson draw (Knuth's algorithm), not the "coin flip with probability λdt" shortcut that silently drops the probability of two or more jumps landing in the same step. Parallelized over path chunks via rayon, with a `splitmix64`-hashed seed per chunk so parallel runs are reproducible and statistically independent. Use this for path-dependent payoffs the CF-inversion pricers can't touch (Asian averages, barriers), not for vanillas, `heston_price`/`bates_price` are exact and far cheaper for those.
+`calibrate_heston_global`/`calibrate_bates_global` are an actual population-based global search (differential evolution, DE/rand/1/bin) instead of repeated local restarts, doesn't need an initial guess at all. Infeasible individuals (mostly Feller violations) get an infinite fitness rather than a repair step, DE's own selection pressure steers the population away from them. DE finds the right basin but doesn't polish well (no gradient), so the winner gets one LM run to finish. Real caveat found while testing this on Bates: DE can converge to an *excellent* fit (rmse ~0) with parameters wildly different from whatever generated the data, that's not a bug, it's Bates' well-known identifiability problem, several very different (v0, kappa, theta, sigma, rho, λ, μⱼ, σⱼ) combinations can price the same finite set of vanilla quotes essentially identically. `calibrate_bates` from a sensible p0 stays near the intended basin because LM only takes local steps; DE has no such bias and no reason to prefer "the generating params" over any other point on the same fitness plateau. Still a local method under the hood once LM polishes, more restarts/generations help but don't guarantee the global optimum.
 
 **Numerics.** `ncdf` delegates to `libm::erfc`, full double precision through the tails (~1e-15), replacing the classical Abramowitz & Stegun 26.2.17 rational approximation the module used before, which has ~1.5e-7 error in the tails, enough to matter when solving implied vol on deep OTM quotes.
 
@@ -107,6 +111,10 @@ let multi = calibrate_heston_multistart(&quotes, p0, 8, 42);
 println!("best rmse={:.4}, {}/{} converged, {} pruned early",
     multi.best.rmse, multi.n_converged, multi.n_restarts, multi.n_pruned);
 
+// real global search, no p0 needed at all
+let global = calibrate_heston_global(&quotes, 40, 60, 777);
+println!("DE+polish rmse={:.4}", global.best.rmse);
+
 // Bates calibration, same engine, 8 params instead of 5, jump columns via AD
 let bp0  = BatesParams { heston: p0, lambda: 0.5, mu_j: -0.1, sigma_j: 0.15 };
 let bres = calibrate_bates(&quotes, bp0);
@@ -130,6 +138,13 @@ let asian = mc_heston(100.0, 1.0, 0.05, 0.0, &params,
     Payoff::AsianArithmetic { strike: 100.0, opt_type: OptionType::Call }, &cfg);
 println!("asian price={:.4} +/- {:.4}", asian.price, asian.std_error);
 
+// QE scheme instead of the default full truncation Euler, worth it when
+// the bias in a Feller-violating / short-dated regime actually matters
+let mut cfg_qe = McConfig::default();
+cfg_qe.scheme = VarianceScheme::QuadraticExponential;
+let qe_price = mc_heston(100.0, 1.0, 0.05, 0.0, &params,
+    Payoff::European { strike: 100.0, opt_type: OptionType::Call }, &cfg_qe);
+
 let barrier = mc_bates(100.0, 1.0, 0.05, 0.0, &params, 0.5, -0.10, 0.15,
     Payoff::UpAndOut { strike: 100.0, barrier: 130.0, rebate: 0.0, opt_type: OptionType::Call }, &cfg);
 
@@ -143,16 +158,16 @@ let bgreeks = batch_bates_greeks(&chain, &bp0);
 
 ## Testing
 
-69 tests, `cargo test --release`, all synchronous and deterministic (no timing-dependent assertions, the Monte Carlo tests use a fixed seed and check convergence against the analytic price within a multiple of the MC's own reported standard error, not a fixed tolerance). A further 5 profiling benchmarks are marked `#[ignore]` since they measure timing, not correctness, run them with `cargo test --release -- --ignored --nocapture --test-threads=1 ad::tests::profile`.
+75 tests, `cargo test --release`, all synchronous and deterministic (no timing-dependent assertions, the Monte Carlo tests use a fixed seed and check convergence against the analytic price within a multiple of the MC's own reported standard error, not a fixed tolerance). A further 6 profiling benchmarks are marked `#[ignore]` since they measure timing, not correctness, run them with `cargo test --release -- --ignored --nocapture --test-threads=1 ad::tests::profile`.
 
 | Module | Tests | Covers |
 |---|---:|---|
 | `local_vol` | 13 | Flat-surface recovery, spline no-overshoot, calendar/butterfly detection and repair, multi-pass cascading repair, non-uniform grid curvature, spline-vs-raw-FD divergence on a kinked surface |
-| `ad` | 13 | Heston and Bates price match their analytic pricers to 1e-6 across strikes and expiries including the short-dated wings that broke the old fixed-panel quadrature, vega within 1% of bump-and-reprice for both, Bates AD collapses to Heston AD when jumps are off, dual `csqrt` matches the builtin value and a finite-difference derivative across a sweep concentrated near the branch cut, jump-parameter sensitivities match FD on the analytic Bates pricer (and their signs are explained, not just asserted, see the drift-compensator note in the test), sign checks |
+| `ad` | 15 | Heston and Bates price match their analytic pricers to 1e-6 across strikes and expiries including the short-dated wings that broke the old fixed-panel quadrature, vega within 1% of bump-and-reprice for both, Bates AD collapses to Heston AD when jumps are off, dual `csqrt` matches the builtin value and a finite-difference derivative across a sweep concentrated near the branch cut, jump-parameter sensitivities match FD on the analytic Bates pricer, `Dual5` (the multi-directional experiment) matches the scalar `Dual` path on every Greek across the same wings grid, sign checks |
+| `calibration` | 9 | Recovers known Heston and Bates params from a synthetic surface, Feller condition always holds post-calibration, multistart never loses to single-start and reliably escapes a deliberately bad initial guess, the early-stop prune mechanism kills a hopeless restart but leaves a competitive one alone, Bates' AD Jacobian columns match an independently-computed pure-FD reference, DE+polish recovers Heston params with no initial guess at all, DE+polish on Bates finds an excellent fit (not necessarily the generating params, see the Design section's identifiability note) |
 | `heston` | 9 | Put-call parity, sign checks, Feller condition, BSM limit (σ→0), no-static-arbitrage across a strike/expiry grid, `fast_csqrt` matches `Complex64::sqrt()` across 680+ swept points including near-axis angles down to 1e-12 radians |
+| `mc` | 7 | European MC matches analytic Heston/Bates within a z-score bound on the MC's own standard error (both schemes), Asian call cheaper than European (real inequality), up-and-out cheaper than vanilla with zero rebate (real inequality), QE cuts bias ~20x vs Euler in a Feller-violating coarse-step regime, Poisson sampler mean check |
 | `bates` | 6 | Recovers Heston when jump intensity is zero, put-call parity, sign checks, no-static-arbitrage |
-| `calibration` | 7 | Recovers known Heston and Bates params from a synthetic surface, Feller condition always holds post-calibration, multistart never loses to single-start and reliably escapes a deliberately bad initial guess, Bates' AD Jacobian columns match an independently-computed pure-FD reference, the early-stop prune mechanism kills a hopeless restart but leaves a competitive one alone |
-| `mc` | 5 | European MC matches analytic Heston/Bates within a z-score bound on the MC's own standard error, Asian call cheaper than European (real inequality), up-and-out cheaper than vanilla with zero rebate (real inequality), Poisson sampler mean check |
 | `batch` | 5 | Batch price matches scalar calls, batch IV round-trips, batch Heston/Bates Greeks match scalar `PricingResult` field-by-field, batch price-only output agrees with batch Greeks output |
 | `bsm` | 4 | Put-call parity, sign checks, Black-76 sanity vs BSM, Black-76 rho vs finite difference |
 | `iv` | 4 | Round-trip recovery at ATM, OTM, and low vol, rejects a price outside no-arbitrage bounds |
@@ -172,14 +187,14 @@ RUSTFLAGS="-C target-cpu=native" cargo run --release
 
 `main.rs::batch_bench` times a 500-option BSM and Heston chain and prints real numbers for whatever box it runs on. `main.rs::heston_ad_demo` does the same for bump-and-reprice vs AD Greeks on a single option, averaged over 2,000 reps. Treat both as a local baseline, not a spec.
 
-Qualitatively: BSM is closed-form and embarrassingly parallel, Heston and Bates cost an adaptive double integral per price (more at short expiries and in the wings, where more panels are needed to hit tolerance), and `heston_greeks_ad` currently runs slower wall-clock than bump-and-reprice despite doing fewer integrations, `Complex<Dual>` arithmetic costs more per quadrature node than plain `Complex64`, see [Known limitations](#known-limitations-and-roadmap).
+Qualitatively BSM is closed-form and embarrassingly parallel, Heston and Bates cost an adaptive double integral per price (more at short expiries and in the wings, where more panels are needed to hit tolerance), and `heston_greeks_ad` currently runs slower wall-clock than bump-and-reprice despite doing fewer integrations, `Complex<Dual>` arithmetic costs more per quadrature node than plain `Complex64`, see [Known limitations](#known-limitations-and-roadmap).
 
 ## Known limitations and roadmap
 
-- Multistart calibration is repeated local optimization with a shared early-stop bound between restarts, not a real global optimizer. More restarts help but don't guarantee the global minimum, and every non-pruned restart still costs a full LM run.
-- Monte Carlo uses full truncation Euler, not the Andersen (2008) QE scheme. Simpler and correct, but biased at large time steps for very low-vol-of-vol or near-zero-variance paths. No Greeks from the MC path either, no wrapper is provided (bumping would mean full path resims plus MC noise on every bump).
-- `heston_greeks_ad`/`bates_greeks_ad` are exact but still measurably slower than bump-and-reprice (~1.4-1.5x, see the Design section's automatic differentiation note for the profiled breakdown). The `Complex<Dual>` multiply/divide overhead is real (5.5x/11x per op) and isn't going away without a different differentiation strategy, this is a structural cost of forward-mode dual arithmetic through a CF integral, not a bug to fix.
-- No CI configured. 69 passing local tests is not the same guarantee as a required check on every PR.
+- `calibrate_heston_global`/`calibrate_bates_global` (DE) is a real global search but has no notion of parameter identifiability, on Bates it can converge to an excellent fit with parameters that don't resemble any sensible market prior, see the Design section's identifiability note. If you need Bates params that look like the market, constrain the search or start LM from a prior, don't trust an unconstrained global optimum to mean anything on its own for an under-identified model.
+- QE (`VarianceScheme::QuadraticExponential`) implements Andersen's base scheme (his eq 33), not the martingale-corrected QE-M variant. Andersen's own paper treats QE (not QE-M) as the practical default, so this isn't a shortcut, but QE-M exists as a further refinement nobody's ported.
+- `heston_greeks_ad5` proves multi-directional dual arithmetic is a real ~3x win at the integration level (measured, `profile_dual5_vs_five_scalar_passes`), but doesn't flip the headline number: `heston_greeks_ad`/`ad5`/`bates_greeks_ad` are still slower than bump-and-reprice overall (~1.3-1.5x) because delta/gamma/theta/rho/vanna/volga are still FD-bumped regardless of which path computes vega. Extending the `Dual5`-style joint pass to cover spot and rate too (not just the 5 Heston CF params) is the next step this result points to, not done here.
+- No CI configured. 75 passing local tests is not the same guarantee as a required check on every PR.
 
 ## Dependencies
 
@@ -187,7 +202,7 @@ Qualitatively: BSM is closed-form and embarrassingly parallel, Heston and Bates 
 num-complex   complex arithmetic for characteristic function inversion
 num-traits    trait bounds for Complex<Dual> in the AD path
 rayon         parallel batch pricing, Monte Carlo paths, and multistart calibration
-rand          RNG for the Monte Carlo engine (SmallRng, seeded per path chunk)
+rand          RNG for Monte Carlo paths, DE population init, and multistart restarts (SmallRng, seeded per unit of parallel work)
 libm          erfc for full-precision ncdf
 ```
 
@@ -208,5 +223,7 @@ No `ndarray`, no `nalgebra`, no linear algebra crate, the calibration Jacobian i
 - Piessens, R., de Doncker-Kapenga, E., Uberhuber, C., Kahaner, D. (1983). *QUADPACK: A Subroutine Package for Automatic Integration.* (Gauss-Kronrod 15-point rule)
 - Brenner, M., Subrahmanyam, M. G. (1988). *A Simple Formula to Compute the Implied Standard Deviation.*
 - Levenberg, K. (1944); Marquardt, D. (1963). (Levenberg-Marquardt nonlinear least squares)
+- Storn, R., Price, K. (1997). *Differential Evolution, A Simple and Efficient Heuristic for Global Optimization over Continuous Spaces.* (DE/rand/1/bin scheme used by `calibrate_heston_global`/`calibrate_bates_global`)
 - Lord, R., Koekkoek, R., van Dijk, D. (2010). *A Comparison of Biased Simulation Schemes for Stochastic Volatility Models.* (full truncation Euler scheme used by the Monte Carlo engine)
+- Andersen, L. (2008). *Efficient Simulation of the Heston Stochastic Volatility Model.* (QE scheme, `VarianceScheme::QuadraticExponential`)
 - Knuth, D. E. (1969). *The Art of Computer Programming, Volume 2: Seminumerical Algorithms.* (exact Poisson sampling used for per-step jump counts)
