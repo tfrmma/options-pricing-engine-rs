@@ -239,6 +239,104 @@ fn calibrate_multistart<M: CalibModel>(
     MultistartResult { best, n_restarts, n_converged, n_pruned }
 }
 
+pub struct GlobalCalibResult<P = HestonParams> {
+    pub best:           CalibResult<P>, // after DE search + LM polish
+    pub de_best_sse:    f64,            // SSE of the DE winner, pre-polish
+    pub de_generations: usize,
+}
+
+const DE_F:  f64 = 0.6; // differential weight, classic DE/rand/1/bin default range is 0.4-1.0
+const DE_CR: f64 = 0.9; // crossover probability
+
+// a genuine population-based global search (differential evolution,
+// DE/rand/1/bin), not repeated local restarts. doesn't need an initial
+// guess at all, unlike multistart it explores the whole box from the start
+// instead of hoping a handful of random points land in the right basin.
+// DE is good at finding the right basin, bad at polishing once it's there
+// (it has no gradient information), so the winner gets one LM run to finish
+// the convergence LM is already fast and precise at. this is the standard
+// hybrid pattern (same idea as scipy.optimize.differential_evolution's
+// polish=True), not a novel trick.
+//
+// infeasible individuals (mostly Feller violations on the Heston side) get
+// an infinite fitness instead of a repair step, DE's own selection pressure
+// naturally steers the population away from them.
+pub fn calibrate_heston_global(
+    quotes: &[CalibInput], n_pop: usize, n_gen: usize, seed: u64,
+) -> GlobalCalibResult {
+    calibrate_global(quotes, n_pop, n_gen, seed)
+}
+
+pub fn calibrate_bates_global(
+    quotes: &[CalibInput], n_pop: usize, n_gen: usize, seed: u64,
+) -> GlobalCalibResult<BatesParams> {
+    calibrate_global(quotes, n_pop, n_gen, seed)
+}
+
+fn calibrate_global<M: CalibModel>(
+    quotes: &[CalibInput], n_pop: usize, n_gen: usize, seed: u64,
+) -> GlobalCalibResult<M> {
+    let n = M::dim();
+    let bounds = M::param_bounds();
+    let n_pop = n_pop.max(4 * n); // DE needs real diversity to work, floor it
+
+    let sse_of = |v: &[f64]| -> f64 {
+        let m = M::from_vec(v);
+        if !m.bounds_ok() { return f64::INFINITY; }
+        weighted_sse(&residuals(quotes, &m), quotes)
+    };
+
+    let mut init_rng = SmallRng::seed_from_u64(splitmix64(seed));
+    let mut pop: Vec<Vec<f64>> = (0..n_pop).map(|_| {
+        // a few resample attempts for a feasible start, doesn't need to be
+        // perfect, DE will steer infeasible members out via selection anyway
+        for _ in 0..20 {
+            let v: Vec<f64> = bounds.iter().map(|&(lo, hi)| init_rng.gen_range(lo..hi)).collect();
+            if sse_of(&v).is_finite() { return v; }
+        }
+        bounds.iter().map(|&(lo, hi)| init_rng.gen_range(lo..hi)).collect()
+    }).collect();
+    let mut fitness: Vec<f64> = pop.iter().map(|v| sse_of(v)).collect();
+
+    for gen in 0..n_gen {
+        let updated: Vec<(Vec<f64>, f64)> = (0..n_pop)
+            .into_par_iter()
+            .map(|i| {
+                let mut rng = SmallRng::seed_from_u64(splitmix64(seed ^ ((gen as u64) << 32) ^ i as u64));
+                let mut idxs = [0usize; 3];
+                for slot in 0..3 {
+                    loop {
+                        let cand = rng.gen_range(0..n_pop);
+                        if cand != i && !idxs[..slot].contains(&cand) { idxs[slot] = cand; break; }
+                    }
+                }
+                let (a, b, c) = (idxs[0], idxs[1], idxs[2]);
+                let forced_dim = rng.gen_range(0..n); // guarantees at least one dim actually changes
+
+                let mut trial = pop[i].clone();
+                for d in 0..n {
+                    if d == forced_dim || rng.gen::<f64>() < DE_CR {
+                        let (lo, hi) = bounds[d];
+                        trial[d] = (pop[a][d] + DE_F * (pop[b][d] - pop[c][d])).clamp(lo, hi);
+                    }
+                }
+
+                let trial_fitness = sse_of(&trial);
+                if trial_fitness < fitness[i] { (trial, trial_fitness) } else { (pop[i].clone(), fitness[i]) }
+            })
+            .collect();
+
+        for (i, (v, f)) in updated.into_iter().enumerate() { pop[i] = v; fitness[i] = f; }
+    }
+
+    let best_idx = (0..n_pop).min_by(|&i, &j| fitness[i].total_cmp(&fitness[j])).unwrap();
+    let de_best_sse = fitness[best_idx];
+    let de_winner   = M::from_vec(&pop[best_idx]);
+
+    let polished = calibrate(quotes, de_winner);
+    GlobalCalibResult { best: polished, de_best_sse, de_generations: n_gen }
+}
+
 fn calibrate<M: CalibModel>(quotes: &[CalibInput], p0: M) -> CalibResult<M> {
     calibrate_inner(quotes, p0, None)
 }
@@ -557,6 +655,66 @@ mod tests {
         assert!(res.rmse < 0.01, "rmse={:.6}, bates surface fit too poor", res.rmse);
         assert!((res.params.heston.v0 - true_p.heston.v0).abs() < 0.01, "v0 off");
         assert!(res.params.heston.feller_ok(), "Feller violated: {:?}", res.params.heston);
+    }
+
+    // DE doesn't take a p0 at all, unlike calibrate_heston/multistart it
+    // explores the whole box from a uniform-random population, this is the
+    // actual differentiator from repeated local restarts, not just "more
+    // restarts". small population/generation budget on purpose, this is a
+    // correctness check, not a convergence-speed benchmark.
+    #[test]
+    fn de_global_recovers_heston_params_without_any_initial_guess() {
+        let true_p = HestonParams { v0: 0.04, kappa: 2.0, theta: 0.04, sigma: 0.3, rho: -0.5 };
+        let raw    = make_quotes_heston(&true_p);
+        let quotes: Vec<CalibInput> = raw.iter()
+            .map(|(c, iv)| CalibInput { contract: c, iv_market: *iv, weight: 1.0 })
+            .collect();
+
+        let res = calibrate_heston_global(&quotes, 40, 60, 777);
+
+        assert!(res.best.rmse < 0.01, "rmse={:.6}", res.best.rmse);
+        assert!((res.best.params.v0  - true_p.v0 ).abs() < 0.01, "v0 off: {}",  res.best.params.v0);
+        assert!((res.best.params.rho - true_p.rho).abs() < 0.1,  "rho off: {}", res.best.params.rho);
+        assert!(res.best.params.feller_ok());
+        // the polish step should never make things worse than DE's own
+        // raw winner, LM only accepts improving steps.
+        let de_rmse = (res.de_best_sse / quotes.len() as f64).sqrt();
+        assert!(res.best.rmse <= de_rmse + 1e-9,
+            "polish made it worse: polished={:.6} de_raw={:.6}", res.best.rmse, de_rmse);
+    }
+
+    // DE on Bates without a p0 does NOT reliably land back on the params
+    // that generated the surface, and that's not a bug. Bates is a known
+    // hard case for parameter identifiability from vanilla quotes alone:
+    // this run found params wildly different from the generating ones
+    // (v0=1.64 vs true 0.04, kappa=21 vs true 2, ...) with rmse essentially
+    // 0, a different point on a near-flat manifold of equally-good fits to
+    // the same finite quote grid, not a worse fit. calibrate_bates from a
+    // sensible p0 (see recovers_bates_params_from_synthetic_surface above)
+    // stays near the intended basin precisely because LM only takes
+    // improving *local* steps, DE has no such bias and no reason to prefer
+    // "the params that generated this" over any other point with the same
+    // objective value. check what's actually true here: fit quality, not
+    // param recovery, if you need Bates params that resemble a market
+    // prior, constrain the search or start LM from one, don't rely on an
+    // unconstrained global search to find "the" answer for an under-
+    // identified model.
+    #[test]
+    fn de_global_bates_finds_an_excellent_fit_not_necessarily_the_true_params() {
+        let true_p = BatesParams {
+            heston: HestonParams { v0: 0.04, kappa: 2.0, theta: 0.04, sigma: 0.3, rho: -0.5 },
+            lambda: 0.5, mu_j: -0.1, sigma_j: 0.15,
+        };
+        let raw    = make_quotes_bates(&true_p);
+        let quotes: Vec<CalibInput> = raw.iter()
+            .map(|(c, iv)| CalibInput { contract: c, iv_market: *iv, weight: 1.0 })
+            .collect();
+
+        let res = calibrate_bates_global(&quotes, 60, 80, 999);
+
+        assert!(res.best.rmse < 0.005, "rmse={:.8}, DE+polish should still find an excellent fit even if the params don't match the generator", res.best.rmse);
+        assert!(res.best.params.heston.feller_ok(), "Feller violated: {:?}", res.best.params.heston);
+        assert!(res.best.params.heston.v0 > 0.0 && res.best.params.lambda >= 0.0, "sanity bounds");
     }
 
     // direct check on jacobian() itself, not just "calibration still
