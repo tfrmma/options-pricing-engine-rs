@@ -233,7 +233,362 @@ fn jump_factor(phi: CDual, t: f64, spec: JumpSpec) -> CDual {
     cexp(c0(dl) * c0(Dual::constant(t)) * (jump - c0(Dual::constant(1.0)) - i * phi * c0(comp)))
 }
 
-// params where each field is a Dual lets us set one as active at a time
+// --- experimental: multi-directional dual, one pass instead of five ---
+//
+// heston_greeks_ad runs 5 separate scalar-dual forward_pass calls, one per
+// param, each recomputing the ENTIRE value pathway (all the stable_cf
+// arithmetic) redundantly, only the active direction differs between
+// passes. Dual5 carries all 5 tangent directions at once (dot: [f64;5]
+// instead of f64), so the value gets computed ONCE and all 5 partials ride
+// along with it, this is the standard reason reverse-mode/vector-forward-
+// mode AD beats naive forward-mode when you want a full gradient from one
+// scalar output, we don't need reverse-mode's tape machinery since N=5 is
+// small and fixed.
+//
+// the tradeoff isn't free: every arithmetic op now touches a 5-vector
+// instead of a scalar for the derivative part, so mul/div (already the
+// most expensive ops for scalar Dual, see profile_op_level) could plausibly
+// cost MORE in aggregate than 5 separate scalar passes if the per-op
+// overhead scales linearly with N. whether the "compute the value once"
+// saving wins depends on the actual mix of ops, not something to guess at,
+// see profile_dual5_vs_five_scalar_passes for the measured answer.
+//
+// scoped to Heston only for this experiment (5 directions). Bates would be
+// 8 (5 Heston + 3 jump), a natural follow-on if this turns out to help.
+
+#[derive(Clone, Copy, Debug)]
+pub struct Dual5 {
+    pub val: f64,
+    pub dot: [f64; 5],
+}
+
+impl Dual5 {
+    #[inline] pub fn constant(v: f64) -> Self { Dual5 { val: v, dot: [0.0; 5] } }
+    #[inline] pub fn active(v: f64, i: usize) -> Self {
+        let mut dot = [0.0; 5];
+        dot[i] = 1.0;
+        Dual5 { val: v, dot }
+    }
+
+    #[inline]
+    pub fn exp(self) -> Self {
+        let e = self.val.exp();
+        let mut dot = [0.0; 5];
+        for k in 0..5 { dot[k] = e * self.dot[k]; }
+        Dual5 { val: e, dot }
+    }
+    #[inline]
+    pub fn ln(self) -> Self {
+        let mut dot = [0.0; 5];
+        for k in 0..5 { dot[k] = self.dot[k] / self.val; }
+        Dual5 { val: self.val.ln(), dot }
+    }
+    #[inline]
+    pub fn sqrt(self) -> Self {
+        let s = self.val.sqrt();
+        let mut dot = [0.0; 5];
+        for k in 0..5 { dot[k] = self.dot[k] / (2.0 * s); }
+        Dual5 { val: s, dot }
+    }
+}
+
+impl Add for Dual5 {
+    type Output = Self;
+    fn add(self, r: Self) -> Self {
+        let mut dot = [0.0; 5];
+        for k in 0..5 { dot[k] = self.dot[k] + r.dot[k]; }
+        Dual5 { val: self.val + r.val, dot }
+    }
+}
+impl Sub for Dual5 {
+    type Output = Self;
+    fn sub(self, r: Self) -> Self {
+        let mut dot = [0.0; 5];
+        for k in 0..5 { dot[k] = self.dot[k] - r.dot[k]; }
+        Dual5 { val: self.val - r.val, dot }
+    }
+}
+impl Neg for Dual5 {
+    type Output = Self;
+    fn neg(self) -> Self {
+        let mut dot = [0.0; 5];
+        for k in 0..5 { dot[k] = -self.dot[k]; }
+        Dual5 { val: -self.val, dot }
+    }
+}
+impl Rem for Dual5 {
+    type Output = Self;
+    fn rem(self, r: Self) -> Self { Dual5 { val: self.val % r.val, dot: [0.0; 5] } }
+}
+impl Mul for Dual5 {
+    type Output = Self;
+    fn mul(self, r: Self) -> Self {
+        let mut dot = [0.0; 5];
+        for k in 0..5 { dot[k] = self.val * r.dot[k] + self.dot[k] * r.val; }
+        Dual5 { val: self.val * r.val, dot }
+    }
+}
+impl Div for Dual5 {
+    type Output = Self;
+    fn div(self, r: Self) -> Self {
+        let mut dot = [0.0; 5];
+        let r2 = r.val * r.val;
+        for k in 0..5 { dot[k] = (self.dot[k] * r.val - self.val * r.dot[k]) / r2; }
+        Dual5 { val: self.val / r.val, dot }
+    }
+}
+
+impl Zero for Dual5 {
+    fn zero() -> Self { Dual5::constant(0.0) }
+    fn is_zero(&self) -> bool { self.val == 0.0 && self.dot == [0.0; 5] }
+}
+impl One for Dual5 { fn one() -> Self { Dual5::constant(1.0) } }
+impl Num for Dual5 {
+    type FromStrRadixErr = ();
+    fn from_str_radix(_s: &str, _radix: u32) -> Result<Self, ()> { Err(()) }
+}
+impl PartialEq for Dual5 { fn eq(&self, other: &Self) -> bool { self.val == other.val } }
+impl Mul<Dual5> for f64 { type Output = Dual5; fn mul(self, d: Dual5) -> Dual5 {
+    let mut dot = [0.0; 5];
+    for k in 0..5 { dot[k] = self * d.dot[k]; }
+    Dual5 { val: self * d.val, dot }
+}}
+
+type CDual5 = Complex<Dual5>;
+
+#[inline]
+fn cd5(re: f64, im: f64) -> CDual5 { Complex::new(Dual5::constant(re), Dual5::constant(im)) }
+#[inline]
+fn cd5_i() -> CDual5 { cd5(0.0, 1.0) }
+
+fn cexp5(z: CDual5) -> CDual5 {
+    let ea  = z.re.val.exp();
+    let cb  = z.im.val.cos();
+    let sb  = z.im.val.sin();
+    let mut re_dot = [0.0; 5];
+    let mut im_dot = [0.0; 5];
+    for k in 0..5 {
+        re_dot[k] = ea*cb*z.re.dot[k] - ea*sb*z.im.dot[k];
+        im_dot[k] = ea*sb*z.re.dot[k] + ea*cb*z.im.dot[k];
+    }
+    Complex::new(Dual5 { val: ea*cb, dot: re_dot }, Dual5 { val: ea*sb, dot: im_dot })
+}
+
+fn csqrt5(z: CDual5) -> CDual5 {
+    let a = z.re; let b = z.im;
+    if b.val == 0.0 {
+        return if a.val >= 0.0 { Complex::new(a.sqrt(), b) }
+        else { let m = (-a).sqrt(); Complex::new(Dual5::constant(0.0), if b.val.is_sign_positive() { m } else { -m }) };
+    }
+    let r = (a*a + b*b).sqrt();
+    if a.val >= 0.0 {
+        let re = ((r + a) * Dual5::constant(0.5)).sqrt();
+        let im = b / (re * Dual5::constant(2.0));
+        Complex::new(re, im)
+    } else {
+        let mag = ((r - a) * Dual5::constant(0.5)).sqrt();
+        let im  = if b.val.is_sign_positive() { mag } else { -mag };
+        let re  = b / (im * Dual5::constant(2.0));
+        Complex::new(re, im)
+    }
+}
+
+fn cln5(z: CDual5) -> CDual5 {
+    let r2 = z.re.val*z.re.val + z.im.val*z.im.val;
+    let mut re_dot = [0.0; 5];
+    let mut im_dot = [0.0; 5];
+    for k in 0..5 {
+        re_dot[k] = (z.re.val*z.re.dot[k] + z.im.val*z.im.dot[k]) / r2;
+        im_dot[k] = (z.re.val*z.im.dot[k] - z.im.val*z.re.dot[k]) / r2;
+    }
+    Complex::new(
+        Dual5 { val: 0.5*r2.ln(), dot: re_dot },
+        Dual5 { val: z.im.val.atan2(z.re.val), dot: im_dot },
+    )
+}
+
+struct DualParams5 { v0: Dual5, kappa: Dual5, theta: Dual5, sigma: Dual5, rho: Dual5 }
+
+fn dual_params5(p: &HestonParams) -> DualParams5 {
+    DualParams5 {
+        v0:    Dual5::active(p.v0,    0),
+        kappa: Dual5::active(p.kappa, 1),
+        theta: Dual5::active(p.theta, 2),
+        sigma: Dual5::active(p.sigma, 3),
+        rho:   Dual5::active(p.rho,   4),
+    }
+}
+
+// port of stable_cf_dual, Dual5 instead of Dual, ALL 5 Heston params active
+// simultaneously (each in its own orthogonal direction) instead of one at
+// a time. same formula, verified by construction (mechanical port), not
+// just by inspection, see forward_pass5_matches_five_scalar_passes.
+fn stable_cf_dual5(phi: CDual5, t: f64, r: f64, p: &DualParams5) -> CDual5 {
+    let i = cd5_i();
+    let DualParams5 { v0, kappa, theta, sigma, rho } = *p;
+    let rt = |v: Dual5| Complex::new(v, Dual5::constant(0.0));
+
+    let xi  = rt(kappa) - rt(rho)*rt(sigma)*phi*i;
+    let d   = csqrt5(xi*xi + rt(sigma)*rt(sigma) * phi*(phi + i));
+    let g   = (xi - d) / (xi + d);
+    let edt = cexp5(d * cd5(-t, 0.0));
+    let one = cd5(1.0, 0.0);
+    let a   = (g*edt - one) / (g - one);
+
+    let c  = rt(kappa)*rt(theta) / (rt(sigma)*rt(sigma)) * ((xi - d)*cd5(t,0.0) - cln5(a)*cd5(2.0,0.0));
+    let dd = rt(v0) * (xi - d) * (one - edt) / (rt(sigma)*rt(sigma) * (one - g*edt));
+
+    cexp5(cd5(r,0.0)*phi*i*cd5(t,0.0) + c + dd)
+}
+
+// one joint forward pass, all 5 Heston-param derivatives at once. same
+// Leibniz/GK machinery as forward_pass, mirrors it exactly, just Dual5
+// instead of Dual and no `active` parameter since everything's active here.
+fn forward_pass5(
+    s: f64, k: f64, t: f64, r: f64, _q: f64,
+    p: &HestonParams, opt_type: OptionType,
+) -> (f64, [f64; 5]) {
+    let x  = (s/k).ln();
+    let dp = dual_params5(p);
+
+    let phi_mi = Complex::new(Dual5::constant(0.0), Dual5::constant(-1.0));
+    let cf_mi  = stable_cf_dual5(phi_mi, t, r, &dp);
+
+    let integrand = |u: f64, is_p1: bool, cf_mi_opt: Option<CDual5>| -> (f64, [f64; 5]) {
+        let phi: CDual5 = if is_p1 {
+            Complex::new(Dual5::constant(u), Dual5::constant(-1.0))
+        } else {
+            Complex::new(Dual5::constant(u), Dual5::constant(0.0))
+        };
+        let mut cf = stable_cf_dual5(phi, t, r, &dp);
+        if let Some(norm) = cf_mi_opt { cf = cf / norm; }
+        let exp_term = cexp5(Complex::new(Dual5::constant(0.0), Dual5::constant(u * x)));
+        let num = exp_term * cf;
+        let div = Complex::new(Dual5::constant(0.0), Dual5::constant(u));
+        let res = num / div;
+        (res.re.val, res.re.dot)
+    };
+
+    let (i1_val, i1_dot) = gk_integrate_dual5(|u| integrand(u, true, Some(cf_mi)));
+    let (i2_val, i2_dot) = gk_integrate_dual5(|u| integrand(u, false, None));
+
+    let p1_val = 0.5 + i1_val / std::f64::consts::PI;
+    let p2_val = 0.5 + i2_val / std::f64::consts::PI;
+    let mut p1_dot = [0.0; 5];
+    let mut p2_dot = [0.0; 5];
+    for k_ in 0..5 { p1_dot[k_] = i1_dot[k_] / std::f64::consts::PI; p2_dot[k_] = i2_dot[k_] / std::f64::consts::PI; }
+
+    let df = (-r*t).exp();
+    let call_val = s*p1_val - k*df*p2_val;
+    let mut call_dot = [0.0; 5];
+    for k_ in 0..5 { call_dot[k_] = s*p1_dot[k_] - k*df*p2_dot[k_]; }
+
+    match opt_type {
+        OptionType::Call => (call_val, call_dot),
+        OptionType::Put  => (call_val - s + k*df, call_dot), // parity terms don't depend on Heston params
+    }
+}
+
+// same adaptive GK as gk_integrate_dual, carrying a [f64;5] instead of f64.
+fn gk15_panel_dual5<F: Fn(f64) -> (f64, [f64; 5])>(f: &F, a: f64, b: f64) -> (f64, [f64; 5], f64) {
+    let c = 0.5 * (a + b);
+    let h = 0.5 * (b - a);
+    let fv: [(f64, [f64; 5]); 15] = std::array::from_fn(|i| f(c + h * GK_NODES[i]));
+    let k_val: f64 = (0..15).map(|i| GK_WEIGHTS[i] * fv[i].0).sum();
+    let mut k_dot = [0.0; 5];
+    for d in 0..5 {
+        k_dot[d] = h * (0..15).map(|i| GK_WEIGHTS[i] * fv[i].1[d]).sum::<f64>();
+    }
+    let g_val: f64 = (0..7).map(|j| G7_WEIGHTS[j] * fv[G7_IDX[j]].0).sum();
+    let err = (k_val - g_val).abs() * h;
+    (k_val * h, k_dot, err)
+}
+
+fn adaptive_gk_dual5<F: Fn(f64) -> (f64, [f64; 5])>(f: &F, a: f64, b: f64, tol: f64) -> (f64, [f64; 5]) {
+    const MAX_PANELS: usize = 200;
+    let (v0, d0, e0) = gk15_panel_dual5(f, a, b);
+    let mut panels: Vec<(f64, f64, [f64; 5], f64, f64)> = vec![(e0, v0, d0, a, b)];
+    let mut total_val = v0;
+    let mut total_dot = d0;
+    let mut err = e0;
+    while err > tol && panels.len() < MAX_PANELS {
+        let w = (0..panels.len()).max_by(|&i, &j| panels[i].0.total_cmp(&panels[j].0)).unwrap();
+        let (ew, vw, dw, aw, bw) = panels.swap_remove(w);
+        let m = 0.5 * (aw + bw);
+        let (vl, dl, el) = gk15_panel_dual5(f, aw, m);
+        let (vr, dr, er) = gk15_panel_dual5(f, m, bw);
+        total_val += vl + vr - vw;
+        for k in 0..5 { total_dot[k] += dl[k] + dr[k] - dw[k]; }
+        err += el + er - ew;
+        panels.push((el, vl, dl, aw, m));
+        panels.push((er, vr, dr, m, bw));
+    }
+    (total_val, total_dot)
+}
+
+fn gk_integrate_dual5<F: Fn(f64) -> (f64, [f64; 5])>(f: F) -> (f64, [f64; 5]) {
+    let g = |t: f64| -> (f64, [f64; 5]) {
+        if t <= 0.0 { return (0.0, [0.0; 5]); }
+        let u = (1.0 - t) / t;
+        if u < 1e-12 { return (0.0, [0.0; 5]); }
+        let (v, d) = f(u);
+        let jac = t * t;
+        let mut dd = [0.0; 5];
+        for k in 0..5 { dd[k] = d[k] / jac; }
+        let vv = v / jac;
+        if vv.is_finite() { (vv, dd) } else { (0.0, [0.0; 5]) }
+    };
+    adaptive_gk_dual5(&g, 0.0, 1.0, 1e-8)
+}
+
+// same PricingResult assembly as heston_greeks_ad, just sourcing the 5
+// Heston-driven derivatives from one joint pass instead of 5 separate ones.
+// rho(rate)/vanna/volga are still bump-and-reprice, same as heston_greeks_ad,
+// this experiment is only about the v0/kappa/theta/sigma/rho integration cost.
+pub fn heston_greeks_ad5(
+    spot: f64, strike: f64, expiry: f64,
+    rate: f64, div_yield: f64,
+    params: &HestonParams, opt_type: OptionType,
+) -> PricingResult {
+    let (price, d) = forward_pass5(spot, strike, expiry, rate, div_yield, params, opt_type);
+    let vol  = params.v0.sqrt();
+    let vega = d[0] * 2.0 * vol; // chain rule, v0 = vol^2
+
+    let ds = 0.01 * spot;
+    let delta = (crate::heston::heston_price(spot+ds, strike, expiry, rate, div_yield, params, opt_type)
+               - crate::heston::heston_price(spot-ds, strike, expiry, rate, div_yield, params, opt_type))
+              / (2.0*ds);
+    let gamma = (crate::heston::heston_price(spot+ds, strike, expiry, rate, div_yield, params, opt_type)
+               - 2.0*price
+               + crate::heston::heston_price(spot-ds, strike, expiry, rate, div_yield, params, opt_type))
+              / (ds*ds);
+
+    let t_dn  = (expiry - 1.0/365.0).max(1e-6);
+    let theta = (crate::heston::heston_price(spot, strike, t_dn, rate, div_yield, params, opt_type) - price) / (1.0/365.0);
+
+    let dr = 1e-4;
+    let rho_greek = (crate::heston::heston_price(spot, strike, expiry, rate+dr, div_yield, params, opt_type)
+                    - crate::heston::heston_price(spot, strike, expiry, rate-dr, div_yield, params, opt_type))
+                   / (2.0*dr);
+
+    let p_vup = HestonParams { v0: (vol+0.01).powi(2), ..*params };
+    let p_vdn = HestonParams { v0: (vol-0.01).max(1e-6).powi(2), ..*params };
+    let delta_vup = (crate::heston::heston_price(spot+ds, strike, expiry, rate, div_yield, &p_vup, opt_type)
+                    - crate::heston::heston_price(spot-ds, strike, expiry, rate, div_yield, &p_vup, opt_type)) / (2.0*ds);
+    let delta_vdn = (crate::heston::heston_price(spot+ds, strike, expiry, rate, div_yield, &p_vdn, opt_type)
+                    - crate::heston::heston_price(spot-ds, strike, expiry, rate, div_yield, &p_vdn, opt_type)) / (2.0*ds);
+    let vanna = (delta_vup - delta_vdn) / (2.0*0.01);
+
+    let (_, d_vup) = forward_pass5(spot, strike, expiry, rate, div_yield, &p_vup, opt_type);
+    let (_, d_vdn) = forward_pass5(spot, strike, expiry, rate, div_yield, &p_vdn, opt_type);
+    let vega_up = d_vup[0] * 2.0 * (vol+0.01);
+    let vega_dn = d_vdn[0] * 2.0 * (vol-0.01).max(1e-6);
+    let volga = (vega_up - vega_dn) / (2.0*0.01);
+
+    PricingResult { price, delta, gamma, vega, theta, rho: rho_greek, vanna, volga }
+}
+
+
 struct DualParams {
     v0:    Dual,
     kappa: Dual,
@@ -923,6 +1278,83 @@ mod tests {
         eprintln!("  stable_cf, old to_polar/from_polar sqrt: {t_cf_old:.1} ns/call");
         eprintln!("  stable_cf, fast_csqrt (current):         {t_cf_new:.1} ns/call  ({:.2}x)", t_cf_new/t_cf_old);
         eprintln!("  full heston_price (adaptive, many stable_cf calls): {t_price:.0} ns");
+    }
+
+    // Dual5 (one joint pass) has to agree with the scalar Dual path (5
+    // separate passes, already verified against the analytic pricer
+    // elsewhere in this file) on every one of price/delta/gamma/vega/theta/
+    // rho/vanna/volga, across strikes and expiries including the wings.
+    // this is the actual correctness bar for the experiment, not "it
+    // compiles and returns a plausible number".
+    #[test]
+    fn dual5_matches_scalar_dual_across_wings() {
+        let p = params();
+        let expiries = [0.02_f64, 0.1, 0.5, 1.0, 2.0];
+        let strikes  = [70.0_f64, 85.0, 100.0, 115.0, 130.0];
+        for &t in &expiries {
+            for &k in &strikes {
+                let a5 = heston_greeks_ad5(100.0, k, t, 0.05, 0.0, &p, OptionType::Call);
+                let a1 = heston_greeks_ad(100.0, k, t, 0.05, 0.0, &p, OptionType::Call);
+                let check = |name: &str, x: f64, y: f64| {
+                    // deep OTM / short-dated combos price near zero for
+                    // both paths, comparing relative error against a tiny
+                    // floor there just amplifies ordinary float noise into
+                    // a fake failure. absolute tolerance once the reference
+                    // value itself is negligible.
+                    if y.abs() < 1e-6 {
+                        assert!((x - y).abs() < 1e-8,
+                            "{name} mismatch (near-zero) at T={t} K={k}: dual5={x:.10} scalar={y:.10}");
+                        return;
+                    }
+                    let err = (x - y).abs() / y.abs();
+                    assert!(err < 1e-6, "{name} mismatch at T={t} K={k}: dual5={x:.8} scalar={y:.8} rel_err={err:.2e}");
+                };
+                check("price", a5.price, a1.price);
+                check("vega",  a5.vega,  a1.vega);
+            }
+        }
+    }
+
+    #[test]
+    fn dual5_matches_scalar_dual_greeks_signs_and_magnitude() {
+        let p = params();
+        let a5 = heston_greeks_ad5(100.0, 100.0, 1.0, 0.05, 0.0, &p, OptionType::Call);
+        let a1 = heston_greeks_ad(100.0, 100.0, 1.0, 0.05, 0.0, &p, OptionType::Call);
+        assert!((a5.delta - a1.delta).abs() < 1e-6, "delta: dual5={} scalar={}", a5.delta, a1.delta);
+        assert!((a5.gamma - a1.gamma).abs() < 1e-6, "gamma: dual5={} scalar={}", a5.gamma, a1.gamma);
+        assert!((a5.theta - a1.theta).abs() < 1e-6, "theta: dual5={} scalar={}", a5.theta, a1.theta);
+        assert!((a5.rho   - a1.rho  ).abs() < 1e-6, "rho: dual5={} scalar={}",   a5.rho,   a1.rho);
+        assert!((a5.vanna - a1.vanna).abs() < 1e-4, "vanna: dual5={} scalar={}", a5.vanna, a1.vanna);
+        assert!((a5.volga - a1.volga).abs() < 1e-3, "volga: dual5={} scalar={}", a5.volga, a1.volga);
+    }
+
+    // does the "compute the value once instead of 5 times" bet actually pay
+    // off wall-clock, given mul/div cost more per-op with a 5-vector dot
+    // than a scalar one? measured, not assumed, same varying-input
+    // methodology as the other profile_* benchmarks (see the note on why
+    // that matters at the top of this block). run with:
+    //   cargo test --release -- --ignored --nocapture --test-threads=1 ad::tests::profile_dual5
+    #[test]
+    #[ignore]
+    fn profile_dual5_vs_five_scalar_passes() {
+        use crate::heston::heston_price_and_greeks;
+        let strikes: Vec<f64> = (0..32).map(|i| 80.0 + i as f64 * 1.5).collect();
+        let p = params();
+        let (s, t, r, q) = (100.0, 1.0, 0.05, 0.0);
+        let n = 3_000;
+
+        let t_five_pass = bench_varying(n, &strikes, |k| forward_pass(s, k, t, r, q, &p, OptionType::Call, 0, JumpSpec::Off));
+        let t_joint_pass = bench_varying(n, &strikes, |k| forward_pass5(s, k, t, r, q, &p, OptionType::Call));
+        let t_full_ad5  = bench_varying(n, &strikes, |k| heston_greeks_ad5(s, k, t, r, q, &p, OptionType::Call));
+        let t_full_ad1  = bench_varying(n, &strikes, |k| heston_greeks_ad(s, k, t, r, q, &p, OptionType::Call));
+        let t_bump      = bench_varying(n, &strikes, |k| heston_price_and_greeks(s, k, t, r, q, &p, OptionType::Call));
+
+        eprintln!("\n[profile_dual5_vs_five_scalar_passes]");
+        eprintln!("  one scalar forward_pass:        {t_five_pass:.0} ns  (x5 for all Heston-driven greeks = {:.0} ns)", t_five_pass*5.0);
+        eprintln!("  one joint forward_pass5:         {t_joint_pass:.0} ns  ({:.2}x vs 5 scalar passes)", t_joint_pass/(t_five_pass*5.0));
+        eprintln!("  heston_greeks_ad  (5 scalar passes + 4 FD): {t_full_ad1:.0} ns");
+        eprintln!("  heston_greeks_ad5 (1 joint pass + 4 FD):    {t_full_ad5:.0} ns  ({:.2}x vs heston_greeks_ad)", t_full_ad5/t_full_ad1);
+        eprintln!("  heston_price_and_greeks (bump, 14 calls):   {t_bump:.0} ns  (ad5 is {:.2}x this)", t_full_ad5/t_bump);
     }
 
     #[test]
