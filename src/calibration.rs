@@ -553,7 +553,7 @@ fn lm_step(jtj: &[Vec<f64>], grad: &[f64], lam: f64, n: usize) -> Vec<f64> {
     let mut dp = vec![0.0_f64; n];
     for i in (0..n).rev() {
         let mut s = b[i];
-        for k in (i+1)..n { s -= a[i][k] * dp[k]; }
+        for (k, &dpk) in dp.iter().enumerate().skip(i + 1) { s -= a[i][k] * dpk; }
         dp[i] = if a[i][i].abs() > 1e-15 { s / a[i][i] } else { 0.0 };
     }
     dp
