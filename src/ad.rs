@@ -273,21 +273,18 @@ impl Dual5 {
     #[inline]
     pub fn exp(self) -> Self {
         let e = self.val.exp();
-        let mut dot = [0.0; 5];
-        for k in 0..5 { dot[k] = e * self.dot[k]; }
+        let dot = std::array::from_fn(|k| e * self.dot[k]);
         Dual5 { val: e, dot }
     }
     #[inline]
     pub fn ln(self) -> Self {
-        let mut dot = [0.0; 5];
-        for k in 0..5 { dot[k] = self.dot[k] / self.val; }
+        let dot = std::array::from_fn(|k| self.dot[k] / self.val);
         Dual5 { val: self.val.ln(), dot }
     }
     #[inline]
     pub fn sqrt(self) -> Self {
         let s = self.val.sqrt();
-        let mut dot = [0.0; 5];
-        for k in 0..5 { dot[k] = self.dot[k] / (2.0 * s); }
+        let dot = std::array::from_fn(|k| self.dot[k] / (2.0 * s));
         Dual5 { val: s, dot }
     }
 }
@@ -295,24 +292,21 @@ impl Dual5 {
 impl Add for Dual5 {
     type Output = Self;
     fn add(self, r: Self) -> Self {
-        let mut dot = [0.0; 5];
-        for k in 0..5 { dot[k] = self.dot[k] + r.dot[k]; }
+        let dot = std::array::from_fn(|k| self.dot[k] + r.dot[k]);
         Dual5 { val: self.val + r.val, dot }
     }
 }
 impl Sub for Dual5 {
     type Output = Self;
     fn sub(self, r: Self) -> Self {
-        let mut dot = [0.0; 5];
-        for k in 0..5 { dot[k] = self.dot[k] - r.dot[k]; }
+        let dot = std::array::from_fn(|k| self.dot[k] - r.dot[k]);
         Dual5 { val: self.val - r.val, dot }
     }
 }
 impl Neg for Dual5 {
     type Output = Self;
     fn neg(self) -> Self {
-        let mut dot = [0.0; 5];
-        for k in 0..5 { dot[k] = -self.dot[k]; }
+        let dot = std::array::from_fn(|k| -self.dot[k]);
         Dual5 { val: -self.val, dot }
     }
 }
@@ -320,20 +314,23 @@ impl Rem for Dual5 {
     type Output = Self;
     fn rem(self, r: Self) -> Self { Dual5 { val: self.val % r.val, dot: [0.0; 5] } }
 }
+// product rule needs a + here, that's not a bug, clippy's heuristic for
+// "suspicious + inside Mul" doesn't know calculus. same pattern as the
+// scalar Dual::mul above, which clippy doesn't flag only because it's
+// written as a single expression instead of a separate `let`.
+#[allow(clippy::suspicious_arithmetic_impl)]
 impl Mul for Dual5 {
     type Output = Self;
     fn mul(self, r: Self) -> Self {
-        let mut dot = [0.0; 5];
-        for k in 0..5 { dot[k] = self.val * r.dot[k] + self.dot[k] * r.val; }
+        let dot = std::array::from_fn(|k| self.val * r.dot[k] + self.dot[k] * r.val);
         Dual5 { val: self.val * r.val, dot }
     }
 }
 impl Div for Dual5 {
     type Output = Self;
     fn div(self, r: Self) -> Self {
-        let mut dot = [0.0; 5];
         let r2 = r.val * r.val;
-        for k in 0..5 { dot[k] = (self.dot[k] * r.val - self.val * r.dot[k]) / r2; }
+        let dot = std::array::from_fn(|k| (self.dot[k] * r.val - self.val * r.dot[k]) / r2);
         Dual5 { val: self.val / r.val, dot }
     }
 }
@@ -349,8 +346,7 @@ impl Num for Dual5 {
 }
 impl PartialEq for Dual5 { fn eq(&self, other: &Self) -> bool { self.val == other.val } }
 impl Mul<Dual5> for f64 { type Output = Dual5; fn mul(self, d: Dual5) -> Dual5 {
-    let mut dot = [0.0; 5];
-    for k in 0..5 { dot[k] = self * d.dot[k]; }
+    let dot = std::array::from_fn(|k| self * d.dot[k]);
     Dual5 { val: self * d.val, dot }
 }}
 
@@ -495,10 +491,7 @@ fn gk15_panel_dual5<F: Fn(f64) -> (f64, [f64; 5])>(f: &F, a: f64, b: f64) -> (f6
     let h = 0.5 * (b - a);
     let fv: [(f64, [f64; 5]); 15] = std::array::from_fn(|i| f(c + h * GK_NODES[i]));
     let k_val: f64 = (0..15).map(|i| GK_WEIGHTS[i] * fv[i].0).sum();
-    let mut k_dot = [0.0; 5];
-    for d in 0..5 {
-        k_dot[d] = h * (0..15).map(|i| GK_WEIGHTS[i] * fv[i].1[d]).sum::<f64>();
-    }
+    let k_dot: [f64; 5] = std::array::from_fn(|d| h * (0..15).map(|i| GK_WEIGHTS[i] * fv[i].1[d]).sum::<f64>());
     let g_val: f64 = (0..7).map(|j| G7_WEIGHTS[j] * fv[G7_IDX[j]].0).sum();
     let err = (k_val - g_val).abs() * h;
     (k_val * h, k_dot, err)
@@ -609,6 +602,10 @@ fn dual_params(p: &HestonParams, active: usize) -> DualParams {
 }
 
 // integrand for one GK node. returns (price_contribution, deriv_contribution).
+// GK node inputs plus the model/jump context needed to evaluate the CF
+// there, splitting this into a struct would just move the same 8 fields
+// one level of indirection away for no real benefit at a call site this hot.
+#[allow(clippy::too_many_arguments)]
 fn dual_integrand(
     u: f64, x: f64, t: f64, r: f64,
     dp: &DualParams, is_p1: bool, cf_mi: Option<CDual>, jump: JumpSpec,
@@ -691,6 +688,10 @@ fn gk_integrate_dual<F: Fn(f64) -> (f64, f64)>(f: F) -> (f64, f64) {
 // the same 5 Heston-driven params, the CF composes exactly like bates_call
 // does (Heston CF * jump CF, multiplied in before integration).
 // returns (price, dprice/dparam).
+// standard pricer-call shape (spot/strike/expiry/rate/div_yield/params/
+// opt_type) plus which param is active and the jump spec, same argument
+// count every pricer in this crate has, not sloppiness specific to this fn.
+#[allow(clippy::too_many_arguments)]
 fn forward_pass(
     s: f64, k: f64, t: f64, r: f64, q: f64,
     p: &HestonParams, opt_type: OptionType, active: usize, jump: JumpSpec,
@@ -802,6 +803,9 @@ pub fn heston_greeks_ad(
 // those params aren't in PricingResult and aren't in the active-param set
 // here, if you need jump-parameter sensitivities for a calibration
 // Jacobian, that's a separate 3-param forward pass someone still has to write.
+// standard pricer-call shape plus the 3 jump params, same convention as
+// bates_price/bates_price_and_greeks elsewhere in the crate.
+#[allow(clippy::too_many_arguments)]
 pub fn bates_greeks_ad(
     spot: f64, strike: f64, expiry: f64,
     rate: f64, div_yield: f64,
@@ -874,6 +878,7 @@ pub struct BatesJumpSensitivities {
 // dual_params gives all-constant when nothing matches that index, see
 // dual_params) and a jump parameter carrying the derivative instead
 // (JumpSpec::Active). 3 forward passes, exact, no bump size to tune.
+#[allow(clippy::too_many_arguments)]
 pub fn bates_jump_sensitivities_ad(
     spot: f64, strike: f64, expiry: f64,
     rate: f64, div_yield: f64,
@@ -1092,16 +1097,16 @@ mod tests {
         let n = 2_000_000;
 
         let t_exp_c  = bench_varying(n, &cs, |z| z.exp());
-        let t_exp_d  = bench_varying(n, &ds, |z| cexp(z));
+        let t_exp_d  = bench_varying(n, &ds, cexp);
         // sqrt: the fair comparison is against fast_csqrt (same algorithm,
         // no dual bookkeeping), not the num-complex builtin, that one goes
         // through to_polar/from_polar (hypot+atan2+sqrt+cos+sin) and isn't
         // the algorithm either sqrt here actually uses anymore.
         let t_sqrt_builtin = bench_varying(n, &cs, |z| z.sqrt());
-        let t_sqrt_fast     = bench_varying(n, &cs, |z| fast_csqrt(z));
-        let t_sqrt_d        = bench_varying(n, &ds, |z| csqrt(z));
+        let t_sqrt_fast     = bench_varying(n, &cs, fast_csqrt);
+        let t_sqrt_d        = bench_varying(n, &ds, csqrt);
         let t_ln_c   = bench_varying(n, &cs, |z| z.ln());
-        let t_ln_d   = bench_varying(n, &ds, |z| cln(z));
+        let t_ln_d   = bench_varying(n, &ds, cln);
 
         eprintln!("\n[profile_transcendental_level]  ({} varying inputs, cycled)", cs.len());
         eprintln!("  exp:  Complex64 {t_exp_c:.3} ns, Complex<Dual> {t_exp_d:.3} ns  ({:.2}x)", t_exp_d/t_exp_c);
