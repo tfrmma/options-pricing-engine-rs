@@ -1,5 +1,7 @@
 # options-pricing-engine-rs
 
+[![CI](https://github.com/tfrmma/options-pricing-engine-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/tfrmma/options-pricing-engine-rs/actions/workflows/ci.yml)
+
 A Rust options pricing library covering Black-Scholes-Merton, Black-76, Heston (1993), Bates (1996), and Dupire local volatility, with full analytic Greeks where closed forms exist, a Halley-iteration implied vol solver, Levenberg-Marquardt calibration (single-start, multistart, and differential-evolution global search) for both Heston and Bates, no-arbitrage surface repair, and a Monte Carlo engine (full truncation Euler or Andersen QE) for path-dependent payoffs. Built for a vol surface update cycle, not a scripting exercise.
 
 License: MIT. See [LICENSE](LICENSE).
@@ -187,14 +189,14 @@ RUSTFLAGS="-C target-cpu=native" cargo run --release
 
 `main.rs::batch_bench` times a 500-option BSM and Heston chain and prints real numbers for whatever box it runs on. `main.rs::heston_ad_demo` does the same for bump-and-reprice vs AD Greeks on a single option, averaged over 2,000 reps. Treat both as a local baseline, not a spec.
 
-Qualitatively BSM is closed-form and embarrassingly parallel, Heston and Bates cost an adaptive double integral per price (more at short expiries and in the wings, where more panels are needed to hit tolerance), and `heston_greeks_ad` currently runs slower wall-clock than bump-and-reprice despite doing fewer integrations, `Complex<Dual>` arithmetic costs more per quadrature node than plain `Complex64`, see [Known limitations](#known-limitations-and-roadmap).
+Qualitatively: BSM is closed-form and embarrassingly parallel, Heston and Bates cost an adaptive double integral per price (more at short expiries and in the wings, where more panels are needed to hit tolerance), and `heston_greeks_ad` currently runs slower wall-clock than bump-and-reprice despite doing fewer integrations, `Complex<Dual>` arithmetic costs more per quadrature node than plain `Complex64`, see [Known limitations](#known-limitations-and-roadmap).
 
 ## Known limitations and roadmap
 
 - `calibrate_heston_global`/`calibrate_bates_global` (DE) is a real global search but has no notion of parameter identifiability, on Bates it can converge to an excellent fit with parameters that don't resemble any sensible market prior, see the Design section's identifiability note. If you need Bates params that look like the market, constrain the search or start LM from a prior, don't trust an unconstrained global optimum to mean anything on its own for an under-identified model.
 - QE (`VarianceScheme::QuadraticExponential`) implements Andersen's base scheme (his eq 33), not the martingale-corrected QE-M variant. Andersen's own paper treats QE (not QE-M) as the practical default, so this isn't a shortcut, but QE-M exists as a further refinement nobody's ported.
 - `heston_greeks_ad5` proves multi-directional dual arithmetic is a real ~3x win at the integration level (measured, `profile_dual5_vs_five_scalar_passes`), but doesn't flip the headline number: `heston_greeks_ad`/`ad5`/`bates_greeks_ad` are still slower than bump-and-reprice overall (~1.3-1.5x) because delta/gamma/theta/rho/vanna/volga are still FD-bumped regardless of which path computes vega. Extending the `Dual5`-style joint pass to cover spot and rate too (not just the 5 Heston CF params) is the next step this result points to, not done here.
-- No CI configured. 75 passing local tests is not the same guarantee as a required check on every PR.
+- CI (`.github/workflows/ci.yml`) pins the toolchain to 1.75.0, the exact version everything here was verified clean against (`cargo build --release --all-targets`, full test suite, `cargo clippy --release --all-targets -- -D warnings`). Bumping it is fine, but re-run clippy locally against the new toolchain first, new Rust releases add new clippy lints and "stable" drifting out from under you is exactly how a previously-green CI starts failing on code nobody touched.
 
 ## Dependencies
 
