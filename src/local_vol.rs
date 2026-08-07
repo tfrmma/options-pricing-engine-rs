@@ -514,7 +514,7 @@ mod arb_tests {
         }
 
         assert!(audit.passes >= 1);
-        assert!(audit.violations.len() > 0, "should have found violations");
+        assert!(!audit.violations.is_empty(), "should have found violations");
     }
 
     #[test]
