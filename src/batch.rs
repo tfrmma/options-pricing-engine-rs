@@ -11,12 +11,12 @@ use crate::bates::{bates_price, bates_price_and_greeks};
 use crate::iv::implied_vol;
 
 pub fn batch_bsm(contracts: &[OptionContract]) -> Vec<PricingResult> {
-    contracts.par_iter().map(|c| bsm_price_and_greeks(c)).collect()
+    contracts.par_iter().map(bsm_price_and_greeks).collect()
 }
 
 // price-only, skip greeks if you just need marks
 pub fn batch_bsm_price(contracts: &[OptionContract]) -> Vec<f64> {
-    contracts.par_iter().map(|c| bsm_price(c)).collect()
+    contracts.par_iter().map(bsm_price).collect()
 }
 
 // price-only. batch_heston_greeks below if you need the full PricingResult.
@@ -81,7 +81,7 @@ mod tests {
     #[test]
     fn iv_roundtrip() {
         let c      = chain(10);
-        let prices: Vec<f64> = c.iter().map(|x| bsm_price(x)).collect();
+        let prices: Vec<f64> = c.iter().map(bsm_price).collect();
         let ivs    = batch_implied_vol(&c, &prices);
         for (iv, contract) in ivs.iter().zip(c.iter()) {
             let iv = iv.expect("solver bailed");
