@@ -39,6 +39,9 @@ pub fn bsm_price_and_greeks(c: &OptionContract) -> PricingResult {
     PricingResult { price, delta, gamma, vega, theta, rho, vanna, volga }
 }
 
+// internal decomposition of the theta formula into named pieces, all
+// already-computed intermediates from the caller, not a public signature.
+#[allow(clippy::too_many_arguments)]
 fn theta_calc(
     seq: f64, ker: f64, r: f64, q: f64,
     npd1: f64, nd1: f64, nd2: f64,
