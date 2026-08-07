@@ -102,6 +102,8 @@ pub fn mc_heston(
     mc_price(spot, expiry, rate, div_yield, params, None, payoff, cfg)
 }
 
+// standard pricer-call shape plus jump params, config, and payoff spec.
+#[allow(clippy::too_many_arguments)]
 pub fn mc_bates(
     spot: f64, expiry: f64, rate: f64, div_yield: f64,
     params: &HestonParams, lambda: f64, mu_j: f64, sigma_j: f64,
@@ -142,6 +144,7 @@ fn draw_step<R: Rng>(rng: &mut R, jumps: Option<(f64, f64, f64)>, dt: f64) -> St
     StepDraw { za, zb, jump_sum }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn mc_price(
     spot: f64, expiry: f64, rate: f64, div_yield: f64,
     hp: &HestonParams, jumps: Option<(f64, f64, f64)>,
