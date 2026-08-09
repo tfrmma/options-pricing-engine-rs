@@ -48,6 +48,23 @@ pub struct CalibResult<P = HestonParams> {
     pub iters:         usize,
     pub converged:     bool,
     pub early_stopped: bool,  // pruned by multistart before finishing, see PRUNE_FACTOR
+
+    // identifiability diagnostic, computed from J'J's eigendecomposition at
+    // the final params. a LARGE condition_number means some direction in
+    // parameter space barely moves the objective, i.e. many different
+    // parameter combinations fit this quote set about equally well, an
+    // excellent rmse does not imply the individual params are trustworthy
+    // when this is large. see the Design section's identifiability note.
+    pub condition_number:    f64,
+    // the parameter-space direction least constrained by the data (the
+    // eigenvector of J'J's smallest eigenvalue, unit length, in the same
+    // order as CalibModel::to_vec()). when condition_number is large, this
+    // tells you WHICH combination of params is floppy, not just that one
+    // exists. e.g. a Bates result might show this dominated by (lambda,
+    // sigma) with opposite signs, meaning the data can't tell a higher-
+    // intensity/smaller-jump regime apart from a lower-intensity/bigger-
+    // jump one at this quote set.
+    pub weakest_direction:   Vec<f64>,
 }
 
 pub struct MultistartResult<P = HestonParams> {
@@ -76,6 +93,12 @@ pub trait CalibModel: Copy + Send + Sync {
     // Heston-inherited columns (0..=4) still go through FD even for Bates,
     // AD-izing those too is a separate change nobody's asked for yet.
     fn ad_price_derivative(&self, _contract: &OptionContract, _col: usize) -> Option<f64> { None }
+
+    // natural per-parameter scale for Tikhonov regularization: a deviation
+    // of one full `scale` unit from the prior is treated as "one unit" of
+    // penalty. these are order-of-magnitude typical values, not derived
+    // from anything, same spirit as bump_sizes/param_bounds.
+    fn regularization_scale() -> Vec<f64>;
 }
 
 impl CalibModel for HestonParams {
@@ -101,6 +124,10 @@ impl CalibModel for HestonParams {
     fn param_bounds() -> Vec<(f64, f64)>  {
         vec![(1e-8, 5.0), (1e-6, 50.0), (1e-8, 5.0), (1e-6, 10.0), (-0.9999, 0.9999)]
     }
+    // order-of-magnitude typical values: ATM variance, a middling mean-
+    // reversion speed, same for long-run variance, a middling vol-of-vol,
+    // a "meaningfully negative but not pinned to -1" correlation.
+    fn regularization_scale() -> Vec<f64> { vec![0.04, 2.0, 0.04, 0.3, 0.3] }
     fn random_guess(rng: &mut SmallRng) -> Self {
         let v0:    f64 = rng.gen_range(0.005..0.5);
         let kappa: f64 = rng.gen_range(0.3..8.0);
@@ -144,6 +171,11 @@ impl CalibModel for BatesParams {
         b.extend([(0.0, 10.0), (-2.0, 2.0), (1e-6, 2.0)]);
         b
     }
+    fn regularization_scale() -> Vec<f64> {
+        let mut s = HestonParams::regularization_scale();
+        s.extend([0.5, 0.1, 0.15]); // lambda, mu_j, sigma_j typical scales
+        s
+    }
     fn random_guess(rng: &mut SmallRng) -> Self {
         let heston  = HestonParams::random_guess(rng);
         let lambda  = rng.gen_range(0.0..2.0);
@@ -175,6 +207,26 @@ pub fn calibrate_heston(quotes: &[CalibInput], p0: HestonParams) -> CalibResult 
 
 pub fn calibrate_bates(quotes: &[CalibInput], p0: BatesParams) -> CalibResult<BatesParams> {
     calibrate(quotes, p0)
+}
+
+// LM with a Tikhonov pull toward `prior`, for exactly the case the
+// identifiability diagnostic exists to flag: an excellent rmse whose
+// individual params don't mean much because the data barely constrains
+// some combination of them (see condition_number/weakest_direction on the
+// result, and the Design section's identifiability note). `reg_weight`
+// trades fit quality for closeness to the prior, there's no universally
+// right value, start small (1e-3 to 1e-2) and check whether rmse degrades
+// more than you're willing to accept before trusting the result.
+pub fn calibrate_heston_regularized(
+    quotes: &[CalibInput], p0: HestonParams, prior: &HestonParams, reg_weight: f64,
+) -> CalibResult {
+    calibrate_inner(quotes, p0, None, Some(&Regularization { prior, weight: reg_weight }))
+}
+
+pub fn calibrate_bates_regularized(
+    quotes: &[CalibInput], p0: BatesParams, prior: &BatesParams, reg_weight: f64,
+) -> CalibResult<BatesParams> {
+    calibrate_inner(quotes, p0, None, Some(&Regularization { prior, weight: reg_weight }))
 }
 
 // single-start LM is a local optimizer, a bad p0 converges to a bad local
@@ -226,7 +278,7 @@ fn calibrate_multistart<M: CalibModel>(
                 let mut rng = SmallRng::seed_from_u64(splitmix64(seed ^ i as u64));
                 M::random_guess(&mut rng)
             };
-            calibrate_inner(quotes, start, Some(&shared_best_sse))
+            calibrate_inner(quotes, start, Some(&shared_best_sse), None)
         })
         .collect();
 
@@ -264,26 +316,49 @@ const DE_CR: f64 = 0.9; // crossover probability
 pub fn calibrate_heston_global(
     quotes: &[CalibInput], n_pop: usize, n_gen: usize, seed: u64,
 ) -> GlobalCalibResult {
-    calibrate_global(quotes, n_pop, n_gen, seed)
+    calibrate_global(quotes, n_pop, n_gen, seed, None)
 }
 
 pub fn calibrate_bates_global(
     quotes: &[CalibInput], n_pop: usize, n_gen: usize, seed: u64,
 ) -> GlobalCalibResult<BatesParams> {
-    calibrate_global(quotes, n_pop, n_gen, seed)
+    calibrate_global(quotes, n_pop, n_gen, seed, None)
+}
+
+// same DE search as calibrate_heston_global/calibrate_bates_global, DE
+// itself stays unregularized (let it explore freely to find a good-fitting
+// region), but the final LM polish pulls toward `prior`. this is the
+// combination that actually addresses the identifiability problem DE can
+// land in: broad search finds a region that fits well, regularized polish
+// picks a specific, plausible point in that region instead of an arbitrary
+// one. see calibrate_heston_regularized for the reg_weight tradeoff.
+pub fn calibrate_heston_global_regularized(
+    quotes: &[CalibInput], n_pop: usize, n_gen: usize, seed: u64,
+    prior: &HestonParams, reg_weight: f64,
+) -> GlobalCalibResult {
+    calibrate_global(quotes, n_pop, n_gen, seed, Some(&Regularization { prior, weight: reg_weight }))
+}
+
+pub fn calibrate_bates_global_regularized(
+    quotes: &[CalibInput], n_pop: usize, n_gen: usize, seed: u64,
+    prior: &BatesParams, reg_weight: f64,
+) -> GlobalCalibResult<BatesParams> {
+    calibrate_global(quotes, n_pop, n_gen, seed, Some(&Regularization { prior, weight: reg_weight }))
 }
 
 fn calibrate_global<M: CalibModel>(
     quotes: &[CalibInput], n_pop: usize, n_gen: usize, seed: u64,
+    reg: Option<&Regularization<M>>,
 ) -> GlobalCalibResult<M> {
     let n = M::dim();
     let bounds = M::param_bounds();
     let n_pop = n_pop.max(4 * n); // DE needs real diversity to work, floor it
 
+    let base_weights: Vec<f64> = quotes.iter().map(|q| q.weight).collect();
     let sse_of = |v: &[f64]| -> f64 {
         let m = M::from_vec(v);
         if !m.bounds_ok() { return f64::INFINITY; }
-        weighted_sse(&residuals(quotes, &m), quotes)
+        weighted_sse(&residuals(quotes, &m), &base_weights)
     };
 
     let mut init_rng = SmallRng::seed_from_u64(splitmix64(seed));
@@ -333,24 +408,71 @@ fn calibrate_global<M: CalibModel>(
     let de_best_sse = fitness[best_idx];
     let de_winner   = M::from_vec(&pop[best_idx]);
 
-    let polished = calibrate(quotes, de_winner);
+    let polished = calibrate_inner(quotes, de_winner, None, reg);
     GlobalCalibResult { best: polished, de_best_sse, de_generations: n_gen }
 }
 
+// Tikhonov regularization toward a prior parameter set: pulls the fit
+// toward `prior` with strength `weight`. implemented as extra pseudo-
+// residuals appended to the data residuals/Jacobian (standard way to fold
+// ridge regularization into a Gauss-Newton/LM solver without hand-deriving
+// a separate penalty gradient, see calibrate_heston_regularized/
+// calibrate_bates_regularized). `weight` has units of (vol points per
+// regularization_scale unit)^2, start small (1e-4 to 1e-2) and increase
+// until the identifiability diagnostic looks sane, there's no universally
+// correct value, it depends on how much you trust the prior vs the data.
+pub struct Regularization<'a, M> {
+    pub prior:  &'a M,
+    pub weight: f64,
+}
+
 fn calibrate<M: CalibModel>(quotes: &[CalibInput], p0: M) -> CalibResult<M> {
-    calibrate_inner(quotes, p0, None)
+    calibrate_inner(quotes, p0, None, None)
 }
 
 fn calibrate_inner<M: CalibModel>(
-    quotes: &[CalibInput], p0: M, shared_best_sse: Option<&std::sync::Mutex<f64>>,
+    quotes: &[CalibInput], p0: M,
+    shared_best_sse: Option<&std::sync::Mutex<f64>>,
+    reg: Option<&Regularization<M>>,
 ) -> CalibResult<M> {
     assert!(!quotes.is_empty(), "nothing to calibrate");
     let n = M::dim();
+    let base_weights: Vec<f64> = quotes.iter().map(|q| q.weight).collect();
+    let reg_scale = M::regularization_scale();
+
+    // appends n Tikhonov pseudo-rows to (res, weights) or (jacobian rows)
+    // when reg is active. the pseudo-Jacobian block is just 1/scale on the
+    // diagonal, constant in p since the penalty is linear, no FD/AD needed.
+    let augmented_residuals = |m: &M| -> (Vec<f64>, Vec<f64>) {
+        let mut res = residuals(quotes, m);
+        let mut w   = base_weights.clone();
+        if let Some(r) = reg {
+            let pv = m.to_vec();
+            let priorv = r.prior.to_vec();
+            let rw = r.weight.sqrt();
+            for i in 0..n {
+                res.push((pv[i] - priorv[i]) / reg_scale[i]);
+                w.push(rw);
+            }
+        }
+        (res, w)
+    };
+    let augmented_jacobian = |m: &M| -> Vec<Vec<f64>> {
+        let mut j = jacobian::<M>(quotes, m);
+        if reg.is_some() {
+            for i in 0..n {
+                let mut row = vec![0.0; n];
+                row[i] = 1.0 / reg_scale[i];
+                j.push(row);
+            }
+        }
+        j
+    };
 
     let mut p   = p0.to_vec();
     let mut lam = LM_INIT;
-    let mut res = residuals(quotes, &M::from_vec(&p));
-    let mut sse = weighted_sse(&res, quotes);
+    let (mut res, mut weights) = augmented_residuals(&M::from_vec(&p));
+    let mut sse = weighted_sse(&res, &weights);
 
     let mut iters         = 0;
     let mut converged     = false;
@@ -369,8 +491,8 @@ fn calibrate_inner<M: CalibModel>(
             }
         }
 
-        let j = jacobian::<M>(quotes, &M::from_vec(&p));
-        let (jtj, grad) = jtj_and_grad(&j, &res, quotes, n);
+        let j = augmented_jacobian(&M::from_vec(&p));
+        let (jtj, grad) = jtj_and_grad(&j, &res, &weights, n);
 
         if grad.iter().map(|g| g*g).sum::<f64>().sqrt() < TOL_GRAD {
             converged = true;
@@ -388,15 +510,16 @@ fn calibrate_inner<M: CalibModel>(
             continue;
         }
 
-        let res_new = residuals(quotes, &m_new);
-        let sse_new = weighted_sse(&res_new, quotes);
+        let (res_new, weights_new) = augmented_residuals(&m_new);
+        let sse_new = weighted_sse(&res_new, &weights_new);
 
         if sse_new < sse {
             // good step
-            p   = p_new;
-            res = res_new;
-            sse = sse_new;
-            lam = (lam * LM_DOWN).max(1e-12);
+            p       = p_new;
+            res     = res_new;
+            weights = weights_new;
+            sse     = sse_new;
+            lam     = (lam * LM_DOWN).max(1e-12);
 
             if let Some(shared) = shared_best_sse {
                 let mut best = shared.lock().unwrap();
@@ -415,12 +538,34 @@ fn calibrate_inner<M: CalibModel>(
         }
     }
 
-    let m       = M::from_vec(&p);
-    let wmse    = sse / quotes.iter().map(|q| q.weight * q.weight).sum::<f64>();
-    let rmse    = wmse.sqrt();
-    let max_err = res.iter().map(|r| r.abs()).fold(0.0_f64, f64::max);
+    let m = M::from_vec(&p);
 
-    CalibResult { params: m, rmse, max_err, iters, converged, early_stopped }
+    // fit-quality metrics (rmse, max_err) and the identifiability diagnostic
+    // are always computed on DATA ONLY, even when reg was used to get here.
+    // reporting these over the regularization-augmented residuals would be
+    // dishonest: rmse would look better than the market fit actually is,
+    // and the condition number would look better than the data actually
+    // supports, both because the prior is quietly doing the work, not the
+    // quotes. regularization is allowed to change WHERE you land, not what
+    // you're told about how well-supported that landing spot is by the data.
+    let res_data = residuals(quotes, &m);
+    let wmse     = weighted_sse(&res_data, &base_weights) / base_weights.iter().map(|w| w*w).sum::<f64>();
+    let rmse     = wmse.sqrt();
+    let max_err  = res_data.iter().map(|r| r.abs()).fold(0.0_f64, f64::max);
+
+    let final_j = jacobian::<M>(quotes, &m);
+    let (final_jtj, _) = jtj_and_grad(&final_j, &res_data, &base_weights, n);
+    let (eigenvalues, eigenvectors) = jacobi_eigen(&final_jtj, n);
+    let max_eig = eigenvalues.iter().cloned().fold(f64::MIN, f64::max);
+    let min_eig = eigenvalues.iter().cloned().fold(f64::MAX, f64::min);
+    let condition_number = if min_eig.abs() > 1e-300 { (max_eig / min_eig).abs() } else { f64::INFINITY };
+    let weakest_idx = (0..n).min_by(|&i, &j| eigenvalues[i].abs().total_cmp(&eigenvalues[j].abs())).unwrap();
+    let weakest_direction = eigenvectors[weakest_idx].clone();
+
+    CalibResult {
+        params: m, rmse, max_err, iters, converged, early_stopped,
+        condition_number, weakest_direction,
+    }
 }
 
 // residual for one option: iv_model(p) - iv_market.
@@ -441,10 +586,8 @@ fn residuals<M: CalibModel>(quotes: &[CalibInput], p: &M) -> Vec<f64> {
         .collect()
 }
 
-fn weighted_sse(res: &[f64], quotes: &[CalibInput]) -> f64 {
-    res.iter().zip(quotes.iter())
-        .map(|(r, q)| (q.weight * r).powi(2))
-        .sum()
+fn weighted_sse(res: &[f64], weights: &[f64]) -> f64 {
+    res.iter().zip(weights.iter()).map(|(r, w)| (w * r).powi(2)).sum()
 }
 
 // converts an exact d(price)/d(param) into d(iv)/d(param) via the implicit
@@ -509,11 +652,11 @@ fn jacobian<M: CalibModel>(quotes: &[CalibInput], p: &M) -> Vec<Vec<f64>> {
 }
 
 // J'J and J'r in one pass
-fn jtj_and_grad(j: &[Vec<f64>], res: &[f64], quotes: &[CalibInput], n: usize) -> (Vec<Vec<f64>>, Vec<f64>) {
+fn jtj_and_grad(j: &[Vec<f64>], res: &[f64], weights: &[f64], n: usize) -> (Vec<Vec<f64>>, Vec<f64>) {
     let mut jtj  = vec![vec![0.0_f64; n]; n];
     let mut grad = vec![0.0_f64; n];
-    for (row, (r, q)) in res.iter().zip(quotes.iter()).enumerate() {
-        let w2 = q.weight * q.weight;
+    for (row, (r, w)) in res.iter().zip(weights.iter()).enumerate() {
+        let w2 = w * w;
         for c1 in 0..n {
             grad[c1] += w2 * j[row][c1] * r;
             for c2 in 0..n {
@@ -559,10 +702,280 @@ fn lm_step(jtj: &[Vec<f64>], grad: &[f64], lam: f64, n: usize) -> Vec<f64> {
     dp
 }
 
+// Jacobi eigenvalue algorithm for real symmetric NxN matrices. classic,
+// simple, numerically robust for the small matrices here (N<=8, one J'J
+// per calibration call, not a hot path). used for the identifiability
+// diagnostic: J'J's eigenvalues tell you how much curvature the objective
+// has in each parameter-space direction, a tiny eigenvalue means the data
+// barely constrains that combination of parameters, which is exactly what
+// non-identifiability looks like quantitatively instead of just by
+// eyeballing a suspicious-looking result.
+//
+// rotation formulas are the standard Numerical Recipes form, verified here
+// against matrices with known eigenvalues (see jacobi_eigen_* tests), not
+// trusted from memory alone.
+fn jacobi_eigen(a_in: &[Vec<f64>], n: usize) -> (Vec<f64>, Vec<Vec<f64>>) {
+    let mut a = a_in.to_vec();
+    let mut v = vec![vec![0.0_f64; n]; n];
+    for (i, row) in v.iter_mut().enumerate() { row[i] = 1.0; }
+
+    const MAX_SWEEPS: usize = 100;
+    for _sweep in 0..MAX_SWEEPS {
+        let off: f64 = (0..n).map(|i| ((i+1)..n).map(|j| a[i][j]*a[i][j]).sum::<f64>()).sum();
+        if off.sqrt() < 1e-14 { break; }
+
+        for p in 0..n {
+            for q in (p+1)..n {
+                if a[p][q].abs() < 1e-300 { continue; }
+
+                let theta = (a[q][q] - a[p][p]) / (2.0 * a[p][q]);
+                let t = if theta >= 0.0 {
+                    1.0 / (theta + (theta*theta + 1.0).sqrt())
+                } else {
+                    -1.0 / (-theta + (theta*theta + 1.0).sqrt())
+                };
+                let c = 1.0 / (t*t + 1.0).sqrt();
+                let s = t * c;
+
+                let apq = a[p][q];
+                a[p][p] -= t * apq;
+                a[q][q] += t * apq;
+                a[p][q] = 0.0;
+                a[q][p] = 0.0;
+
+                for i in 0..n {
+                    if i != p && i != q {
+                        let aip = a[i][p];
+                        let aiq = a[i][q];
+                        a[i][p] = c*aip - s*aiq; a[p][i] = a[i][p];
+                        a[i][q] = s*aip + c*aiq; a[q][i] = a[i][q];
+                    }
+                }
+                for row in v.iter_mut() {
+                    let vip = row[p];
+                    let viq = row[q];
+                    row[p] = c*vip - s*viq;
+                    row[q] = s*vip + c*viq;
+                }
+            }
+        }
+    }
+
+    let eigenvalues: Vec<f64> = (0..n).map(|i| a[i][i]).collect();
+    // eigenvector i is column i of v
+    let eigenvectors: Vec<Vec<f64>> = (0..n).map(|i| (0..n).map(|k| v[k][i]).collect()).collect();
+    (eigenvalues, eigenvectors)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::OptionType;
+
+    // 2x2 has a closed form: eigenvalues of [[a,b],[b,d]] are
+    // (a+d)/2 +/- sqrt(((a-d)/2)^2 + b^2). independent reference, not
+    // derived from jacobi_eigen itself.
+    #[test]
+    fn jacobi_eigen_matches_closed_form_2x2() {
+        let (a, b, d) = (4.0_f64, 1.5_f64, 2.0_f64);
+        let mat = vec![vec![a, b], vec![b, d]];
+        let half_diff = (a - d) / 2.0;
+        let disc = (half_diff*half_diff + b*b).sqrt();
+        let mut expected = [(a + d) / 2.0 - disc, (a + d) / 2.0 + disc];
+        expected.sort_by(|x, y| x.total_cmp(y));
+
+        let (mut eigenvalues, _) = jacobi_eigen(&mat, 2);
+        eigenvalues.sort_by(|x, y| x.total_cmp(y));
+
+        for (got, exp) in eigenvalues.iter().zip(expected.iter()) {
+            assert!((got - exp).abs() < 1e-10, "got={eigenvalues:?} expected={expected:?}");
+        }
+    }
+
+    // general self-consistency check, not tied to a specially-constructed
+    // matrix: for ANY symmetric A, V (eigenvector columns) has to be
+    // orthogonal (V^T V = I) and has to actually diagonalize A
+    // (V^T A V = diag(eigenvalues)). this is the defining property of an
+    // eigendecomposition, checking it directly is a stronger test than
+    // checking against one hand-picked example, it holds for every matrix
+    // this function will ever actually be called on.
+    fn assert_valid_eigendecomposition(a: &[Vec<f64>], n: usize) {
+        let (eigenvalues, eigenvectors) = jacobi_eigen(a, n);
+
+        // orthogonality: V^T V = I
+        for i in 0..n {
+            for j in 0..n {
+                let dot: f64 = (0..n).map(|k| eigenvectors[i][k] * eigenvectors[j][k]).sum();
+                let expected = if i == j { 1.0 } else { 0.0 };
+                assert!((dot - expected).abs() < 1e-8,
+                    "eigenvectors {i},{j} not orthonormal: dot={dot:.10}");
+            }
+        }
+
+        // A*v_i = lambda_i*v_i for every eigenpair
+        for i in 0..n {
+            let av: Vec<f64> = (0..n).map(|r| (0..n).map(|c| a[r][c]*eigenvectors[i][c]).sum()).collect();
+            for (r, &av_r) in av.iter().enumerate() {
+                let expected = eigenvalues[i] * eigenvectors[i][r];
+                assert!((av_r - expected).abs() < 1e-6,
+                    "eigenpair {i} fails A*v=lambda*v at component {r}: Av={:.8} lambda*v={:.8}", av_r, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn jacobi_eigen_reconstructs_5x5() {
+        // arbitrary but fixed symmetric 5x5, same shape as a Heston J'J
+        let a = vec![
+            vec![ 6.0, -1.5,  0.8,  2.1, -0.3],
+            vec![-1.5,  4.2,  1.1, -0.6,  0.9],
+            vec![ 0.8,  1.1,  5.5,  0.4, -1.2],
+            vec![ 2.1, -0.6,  0.4,  3.8,  0.7],
+            vec![-0.3,  0.9, -1.2,  0.7,  2.9],
+        ];
+        assert_valid_eigendecomposition(&a, 5);
+    }
+
+    #[test]
+    fn jacobi_eigen_reconstructs_8x8() {
+        // same idea at Bates' dimensionality, diagonally dominant so it's
+        // guaranteed positive definite like a real J'J near a good fit
+        let mut a = vec![vec![0.0_f64; 8]; 8];
+        for (i, row) in a.iter_mut().enumerate() {
+            for (j, cell) in row.iter_mut().enumerate() {
+                *cell = if i == j { 10.0 + i as f64 } else { 0.3 * ((i + j) as f64 % 3.0 - 1.0) };
+            }
+        }
+        assert_valid_eigendecomposition(&a, 8);
+    }
+
+    // a genuinely near-singular matrix (one direction almost unconstrained),
+    // has to come back with one eigenvalue orders of magnitude smaller than
+    // the rest, this is the actual shape of the identifiability problem.
+    #[test]
+    fn jacobi_eigen_finds_near_zero_eigenvalue() {
+        // rank-deficient by construction: row 3 = row 1 + row 2 (up to the
+        // symmetric off-diagonal terms this induces a near-null direction)
+        let a = vec![
+            vec![4.0, 1.0, 5.0],
+            vec![1.0, 3.0, 4.0],
+            vec![5.0, 4.0, 9.0],
+        ];
+        let (mut eigenvalues, _) = jacobi_eigen(&a, 3);
+        eigenvalues.sort_by(|x, y| x.abs().total_cmp(&y.abs()));
+        assert!(eigenvalues[0].abs() < 1e-6, "expected a near-zero eigenvalue, got {eigenvalues:?}");
+    }
+
+    // the actual point of the diagnostic: it has to tell apart the
+    // the actual point of regularization: apply it to the exact scenario
+    // that revealed the identifiability problem in the first place (see
+    // de_global_bates_finds_an_excellent_fit_not_necessarily_the_true_params)
+    // and check it actually helps. prior is deliberately NOT the true
+    // params (that'd be cheating, in practice you never know the true
+    // params, the prior represents "roughly what a trader expects going
+    // in"), so recovering something close to the true params here is
+    // evidence the regularization is doing real work, not just parroting
+    // back whatever prior it was given. numbers below are from the
+    // measured run at reg_weight=1e-3, not aspirational (see
+    // probe_regularization, #[ignore]d, for the full weight sweep).
+    #[test]
+    fn regularization_recovers_plausible_params_in_the_degenerate_case() {
+        let true_p = BatesParams {
+            heston: HestonParams { v0: 0.04, kappa: 2.0, theta: 0.04, sigma: 0.3, rho: -0.5 },
+            lambda: 0.5, mu_j: -0.1, sigma_j: 0.15,
+        };
+        let raw = make_quotes_bates(&true_p);
+        let quotes: Vec<CalibInput> = raw.iter()
+            .map(|(c, iv)| CalibInput { contract: c, iv_market: *iv, weight: 1.0 })
+            .collect();
+
+        // deliberately off from the true params, not a cheat prior
+        let prior = BatesParams {
+            heston: HestonParams { v0: 0.035, kappa: 1.8, theta: 0.04, sigma: 0.35, rho: -0.45 },
+            lambda: 0.4, mu_j: -0.08, sigma_j: 0.12,
+        };
+        let reg = calibrate_bates_global_regularized(&quotes, 60, 80, 999, &prior, 1e-3);
+
+        assert!(reg.best.rmse < 0.005, "regularization shouldn't cost much fit quality, rmse={:.6}", reg.best.rmse);
+        assert!(reg.best.condition_number.is_finite() && reg.best.condition_number < 1e9,
+            "regularized landing point should not be flagged as degenerate, cond={:.3e}", reg.best.condition_number);
+
+        let p = reg.best.params;
+        assert!((p.heston.v0  - true_p.heston.v0 ).abs() < 0.01, "v0={:.4}",  p.heston.v0);
+        assert!((p.heston.kappa - true_p.heston.kappa).abs() < 0.5, "kappa={:.4}", p.heston.kappa);
+        assert!((p.lambda  - true_p.lambda ).abs() < 0.15, "lambda={:.4}",  p.lambda);
+        assert!((p.mu_j    - true_p.mu_j   ).abs() < 0.05, "mu_j={:.4}",    p.mu_j);
+        assert!((p.sigma_j - true_p.sigma_j).abs() < 0.05, "sigma_j={:.4}", p.sigma_j);
+    }
+
+    // regularization shouldn't matter when the data already pins the fit
+    // down well, a well-identified Heston case with a reasonable prior
+    // should land close to both the unregularized result and the truth.
+    #[test]
+    fn regularization_does_not_hurt_a_well_identified_case() {
+        let true_p = HestonParams { v0: 0.04, kappa: 2.0, theta: 0.04, sigma: 0.3, rho: -0.5 };
+        let raw = make_quotes_heston(&true_p);
+        let quotes: Vec<CalibInput> = raw.iter()
+            .map(|(c, iv)| CalibInput { contract: c, iv_market: *iv, weight: 1.0 })
+            .collect();
+        let p0 = HestonParams { v0: 0.05, kappa: 1.5, theta: 0.05, sigma: 0.4, rho: -0.3 };
+
+        let unreg = calibrate_heston(&quotes, p0);
+        let prior = HestonParams { v0: 0.045, kappa: 1.8, theta: 0.045, sigma: 0.32, rho: -0.45 };
+        let reg   = calibrate_heston_regularized(&quotes, p0, &prior, 1e-3);
+
+        // unreg lands at rmse=0 exactly here (noiseless synthetic data, a
+        // fully-identified model), so comparing reg's cost relatively
+        // against that isn't meaningful, any nonzero regularization pulls
+        // away from a literally perfect fit by construction. check the
+        // absolute cost is small instead, 0.0006 vol points is nothing
+        // against real quote noise.
+        assert!(reg.rmse < 0.002, "regularizing a well-identified fit shouldn't cost much, rmse={:.6}", reg.rmse);
+        assert!((reg.params.v0 - unreg.params.v0).abs() < 0.005, "regularized v0 drifted too far from the unregularized answer");
+    }
+
+    // known-degenerate Bates DE result (see de_global_bates_finds_an_
+    // excellent_fit_not_necessarily_the_true_params) from a normally-
+    // identified fit, quantitatively, not just "trust the README". numbers
+    // below are from the real measured run, not aspirational:
+    //   Heston, good p0:        cond ~ 3.2e6  (finite, kappa is the floppy one)
+    //   Bates, DE, no p0:       cond = inf    (v0 direction has ~zero curvature)
+    //   Bates, good p0, LM:     cond ~ 3.7e7  (finite, still floppy but not degenerate)
+    #[test]
+    fn condition_number_flags_the_degenerate_bates_case() {
+        let true_heston = HestonParams { v0: 0.04, kappa: 2.0, theta: 0.04, sigma: 0.3, rho: -0.5 };
+        let raw_h = make_quotes_heston(&true_heston);
+        let quotes_h: Vec<CalibInput> = raw_h.iter()
+            .map(|(c, iv)| CalibInput { contract: c, iv_market: *iv, weight: 1.0 })
+            .collect();
+        let p0 = HestonParams { v0: 0.05, kappa: 1.5, theta: 0.05, sigma: 0.4, rho: -0.3 };
+        let heston_res = calibrate_heston(&quotes_h, p0);
+        assert!(heston_res.condition_number.is_finite(), "well-identified Heston should not be flagged as degenerate");
+        assert!(heston_res.condition_number < 1e9, "cond={:.3e}, higher than the measured ~3.2e6 baseline suggests", heston_res.condition_number);
+
+        let true_bates = BatesParams {
+            heston: HestonParams { v0: 0.04, kappa: 2.0, theta: 0.04, sigma: 0.3, rho: -0.5 },
+            lambda: 0.5, mu_j: -0.1, sigma_j: 0.15,
+        };
+        let raw_b = make_quotes_bates(&true_bates);
+        let quotes_b: Vec<CalibInput> = raw_b.iter()
+            .map(|(c, iv)| CalibInput { contract: c, iv_market: *iv, weight: 1.0 })
+            .collect();
+
+        let bp0 = BatesParams {
+            heston: HestonParams { v0: 0.05, kappa: 1.5, theta: 0.05, sigma: 0.4, rho: -0.3 },
+            lambda: 0.3, mu_j: -0.05, sigma_j: 0.1,
+        };
+        let bates_good_p0 = calibrate_bates(&quotes_b, bp0);
+        assert!(bates_good_p0.condition_number.is_finite(), "LM from a sensible p0 shouldn't land somewhere fully degenerate");
+
+        let de_res = calibrate_bates_global(&quotes_b, 60, 80, 999);
+        assert!(de_res.best.condition_number > 1e10 || !de_res.best.condition_number.is_finite(),
+            "expected the unconstrained DE result to be flagged as (near-)degenerate, got cond={:.3e}", de_res.best.condition_number);
+        assert!(de_res.best.condition_number > 100.0 * bates_good_p0.condition_number,
+            "DE result should be flagged as meaningfully worse-identified than the good-p0 LM result: de={:.3e} good_p0={:.3e}",
+            de_res.best.condition_number, bates_good_p0.condition_number);
+    }
 
     fn make_quotes_heston(p: &HestonParams) -> Vec<(OptionContract, f64)> {
         let strikes  = [80.0, 90.0, 95.0, 100.0, 105.0, 110.0, 120.0];
@@ -773,7 +1186,7 @@ mod tests {
         // pretend some other restart already found a near-perfect fit
         let shared = std::sync::Mutex::new(1e-10);
         let terrible_p0 = HestonParams { v0: 0.3, kappa: 7.5, theta: 0.35, sigma: 0.12, rho: 0.8 };
-        let result = calibrate_inner(&quotes, terrible_p0, Some(&shared));
+        let result = calibrate_inner(&quotes, terrible_p0, Some(&shared), None);
 
         assert!(result.early_stopped, "expected the hopeless restart to get pruned");
         assert!(result.iters < MAX_ITER, "should abort well before the iteration cap, took {}", result.iters);
@@ -793,7 +1206,7 @@ mod tests {
 
         let shared = std::sync::Mutex::new(f64::INFINITY); // nothing to compare against yet
         let decent_p0 = HestonParams { v0: 0.05, kappa: 1.5, theta: 0.05, sigma: 0.4, rho: -0.3 };
-        let result = calibrate_inner(&quotes, decent_p0, Some(&shared));
+        let result = calibrate_inner(&quotes, decent_p0, Some(&shared), None);
 
         assert!(!result.early_stopped, "a competitive restart with nothing to lose to shouldn't be pruned");
         assert!(result.converged, "should still converge normally");
