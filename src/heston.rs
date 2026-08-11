@@ -87,10 +87,19 @@ fn heston_call(s: f64, k: f64, t: f64, r: f64, q: f64, p: &HestonParams) -> f64 
 
     // CF(-i) = e^{(r-q)T} is the normalizer that turns CF(u-i) into the
     // characteristic function under the stock-measure (needed for P1).
-    let cf_mi = stable_cf(Complex64::new(0.0, -1.0), t, r, p);
+    //
+    // the CF drift is r-q, not r. the payoff below already discounts the stock leg by
+    // e^{-qT}, so feeding the CF a q-free drift prices P1/P2 in a world without
+    // dividends and then discounts as if there were some. the two legs disagree by
+    // roughly 2.5% at q=5%, T=1, ATM. collapsing sigma and kappa toward zero (so
+    // variance is frozen at v0) and comparing against BSM at vol=sqrt(v0) shows it
+    // directly: exact to machine precision at q=0 either way, off by -0.19 at q=0.05
+    // with drift r, and back to machine precision once the drift carries q.
+    let mu = r - q;
+    let cf_mi = stable_cf(Complex64::new(0.0, -1.0), t, mu, p);
 
-    let i1 = gk_integrate(|u| cf_integrand(u, x, t, r, p, true, Some(cf_mi)));
-    let i2 = gk_integrate(|u| cf_integrand(u, x, t, r, p, false, None));
+    let i1 = gk_integrate(|u| cf_integrand(u, x, t, mu, p, true, Some(cf_mi)));
+    let i2 = gk_integrate(|u| cf_integrand(u, x, t, mu, p, false, None));
 
     let p1 = 0.5 + i1 / std::f64::consts::PI;
     let p2 = 0.5 + i2 / std::f64::consts::PI;
@@ -236,6 +245,31 @@ mod tests {
     fn params() -> HestonParams {
         // 2*kappa*theta=0.16 > sigma^2=0.09, Feller satisfied
         HestonParams { v0: 0.04, kappa: 2.0, theta: 0.04, sigma: 0.3, rho: -0.7 }
+    }
+
+    // with vol-of-vol and mean reversion driven to zero the variance is frozen at v0,
+    // so Heston has to collapse onto BSM at vol=sqrt(v0). run it *with a dividend*:
+    // that is the case that catches a CF drift which forgot q, since a q-free drift
+    // still matches BSM exactly at q=0 and only breaks once there is carry.
+    #[test]
+    fn degenerates_to_bsm_with_dividend() {
+        use crate::bsm::bsm_price;
+        use crate::types::OptionContract;
+        let flat = HestonParams { v0: 0.04, kappa: 1e-8, theta: 0.04, sigma: 1e-8, rho: 0.0 };
+        let (s, t, r) = (100.0, 1.0, 0.05);
+        for q in [0.0, 0.02, 0.05] {
+            for k in [90.0, 100.0, 110.0] {
+                for opt in [OptionType::Call, OptionType::Put] {
+                    let hp = heston_price(s, k, t, r, q, &flat, opt);
+                    let bp = bsm_price(&OptionContract {
+                        spot: s, strike: k, expiry: t, rate: r, div_yield: q,
+                        vol: flat.v0.sqrt(), opt_type: opt,
+                    });
+                    assert!((hp - bp).abs() < 1e-3,
+                            "q={q} K={k} {opt:?}: heston {hp:.6} vs bsm {bp:.6}");
+                }
+            }
+        }
     }
 
     // fast_csqrt replaced Complex64::sqrt()'s to_polar/from_polar path in

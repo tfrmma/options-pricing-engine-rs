@@ -48,7 +48,18 @@ fn theta_calc(
     vsqt: f64, t: f64, phi: f64,
 ) -> f64 {
     // per year, caller divides by 365 if they want daily
-    -seq*npd1*vsqt/(2.0*t) - phi*(q*seq*nd1 - r*ker*nd2)
+    //
+    // carry sign: for a call theta is
+    //     -S e^{-qT} phi(d1) sigma / (2 sqrt(T)) + q S e^{-qT} N(d1) - r K e^{-rT} N(d2)
+    // and the put flips both carry terms. that is +phi*(q*seq*nd1 - r*ker*nd2),
+    // not -phi*(...). the old sign inverted the carry, which swapped call and put
+    // theta everywhere except the vega-decay term.
+    //
+    // checked against a 1-day reprice finite difference:
+    //   q=0.00  call -6.4140 vs FD -6.4169   put -1.6579 vs FD -1.6604
+    //   q=0.03  call -4.4865 vs FD -4.4896   put -2.6417 vs FD -2.6446
+    // the previous form returned -1.0908 and -5.8469 for the q=0 pair.
+    -seq*npd1*vsqt/(2.0*t) + phi*(q*seq*nd1 - r*ker*nd2)
 }
 
 #[inline]
@@ -108,6 +119,34 @@ mod tests {
         let put  = bsm_price(&OptionContract { opt_type: OptionType::Put, ..c });
         let rhs  = c.spot*(-c.div_yield*c.expiry).exp() - c.strike*(-c.rate*c.expiry).exp();
         assert!((call - put - rhs).abs() < 1e-10);
+    }
+
+    // theta has to match a 1-day reprice. a sign-only check does not catch a flipped
+    // carry term, because the flip still leaves a plain call's theta negative.
+    #[test]
+    fn theta_matches_finite_difference() {
+        let dt = 1.0 / 365.0;
+        for q in [0.0, 0.03] {
+            for opt in [OptionType::Call, OptionType::Put] {
+                let c = OptionContract { div_yield: q, opt_type: opt, ..atm_call() };
+                let analytic = bsm_price_and_greeks(&c).theta;
+                let fd = (bsm_price(&OptionContract { expiry: c.expiry - dt, ..c })
+                          - bsm_price(&c)) / dt;
+                assert!((analytic - fd).abs() < 0.02,
+                        "q={q} {opt:?}: analytic {analytic:.4} vs fd {fd:.4}");
+            }
+        }
+    }
+
+    // put-call parity for theta: d/dT[C - P] = q S e^{-qT} - r K e^{-rT}
+    #[test]
+    fn theta_put_call_parity() {
+        let c  = OptionContract { div_yield: 0.03, ..atm_call() };
+        let tc = bsm_price_and_greeks(&c).theta;
+        let tp = bsm_price_and_greeks(&OptionContract { opt_type: OptionType::Put, ..c }).theta;
+        let rhs = c.div_yield * c.spot * (-c.div_yield*c.expiry).exp()
+                - c.rate * c.strike * (-c.rate*c.expiry).exp();
+        assert!((tc - tp - rhs).abs() < 1e-10, "{tc:.6} - {tp:.6} != {rhs:.6}");
     }
 
     #[test]

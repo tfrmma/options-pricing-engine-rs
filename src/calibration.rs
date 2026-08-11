@@ -505,8 +505,16 @@ fn calibrate_inner<M: CalibModel>(
         let m_new = M::from_vec(&p_new);
 
         // reject any step that violates Feller (Heston side) or param bounds
+        //
+        // the LM_MAX bail-out belongs here too, not only on the bad-step branch below.
+        // a start point wedged against a constraint boundary otherwise burns every
+        // MAX_ITER iteration with lambda pinned at the ceiling and returns the initial
+        // guess, reporting iters == MAX_ITER. that reads like "still working" when it
+        // means "stuck since iteration 3", and the resulting rmse is just the fit
+        // quality of the initial guess.
         if !m_new.bounds_ok() {
             lam = (lam * LM_UP).min(LM_MAX);
+            if lam >= LM_MAX { break; }
             continue;
         }
 
