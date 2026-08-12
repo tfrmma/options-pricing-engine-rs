@@ -588,8 +588,16 @@ fn single_residual<M: CalibModel>(contract: &OptionContract, iv_mkt: f64, p: &M)
     }
 }
 
+// parallel across quotes. every residual is an independent CF integration plus an IV
+// inversion, so this is the innermost place where real work lives: one LM iteration
+// costs (1 + dim) residual sweeps, and each sweep is len(quotes) of those.
+//
+// the multistart entry points already spread restarts across threads, but a plain
+// calibrate_* call has exactly one restart, so without this the whole calibration runs
+// on a single core no matter what RAYON_NUM_THREADS says. rayon nests safely via
+// work-stealing, so the multistart paths keep working unchanged.
 fn residuals<M: CalibModel>(quotes: &[CalibInput], p: &M) -> Vec<f64> {
-    quotes.iter()
+    quotes.par_iter()
         .map(|q| single_residual(q.contract, q.iv_market, p))
         .collect()
 }
