@@ -441,14 +441,16 @@ fn stable_cf_dual5(phi: CDual5, t: f64, r: f64, p: &DualParams5) -> CDual5 {
 // Leibniz/GK machinery as forward_pass, mirrors it exactly, just Dual5
 // instead of Dual and no `active` parameter since everything's active here.
 fn forward_pass5(
-    s: f64, k: f64, t: f64, r: f64, _q: f64,
+    s: f64, k: f64, t: f64, r: f64, q: f64,
     p: &HestonParams, opt_type: OptionType,
 ) -> (f64, [f64; 5]) {
     let x  = (s/k).ln();
     let dp = dual_params5(p);
 
+    // CF drift is r-q, same fix as heston_call / forward_pass above.
+    let mu = r - q;
     let phi_mi = Complex::new(Dual5::constant(0.0), Dual5::constant(-1.0));
-    let cf_mi  = stable_cf_dual5(phi_mi, t, r, &dp);
+    let cf_mi  = stable_cf_dual5(phi_mi, t, mu, &dp);
 
     let integrand = |u: f64, is_p1: bool, cf_mi_opt: Option<CDual5>| -> (f64, [f64; 5]) {
         let phi: CDual5 = if is_p1 {
@@ -456,7 +458,7 @@ fn forward_pass5(
         } else {
             Complex::new(Dual5::constant(u), Dual5::constant(0.0))
         };
-        let mut cf = stable_cf_dual5(phi, t, r, &dp);
+        let mut cf = stable_cf_dual5(phi, t, mu, &dp);
         if let Some(norm) = cf_mi_opt { cf = cf / norm; }
         let exp_term = cexp5(Complex::new(Dual5::constant(0.0), Dual5::constant(u * x)));
         let num = exp_term * cf;
@@ -474,14 +476,17 @@ fn forward_pass5(
     let mut p2_dot = [0.0; 5];
     for k_ in 0..5 { p1_dot[k_] = i1_dot[k_] / std::f64::consts::PI; p2_dot[k_] = i2_dot[k_] / std::f64::consts::PI; }
 
-    let df = (-r*t).exp();
-    let call_val = s*p1_val - k*df*p2_val;
+    // stock leg carries e^{-qT}, same as heston_call / forward_pass. the old
+    // form (bare s, and bare s in the parity terms) silently priced q=0.
+    let df  = (-r*t).exp();
+    let seq = s * (-q*t).exp();
+    let call_val = seq*p1_val - k*df*p2_val;
     let mut call_dot = [0.0; 5];
-    for k_ in 0..5 { call_dot[k_] = s*p1_dot[k_] - k*df*p2_dot[k_]; }
+    for k_ in 0..5 { call_dot[k_] = seq*p1_dot[k_] - k*df*p2_dot[k_]; }
 
     match opt_type {
         OptionType::Call => (call_val, call_dot),
-        OptionType::Put  => (call_val - s + k*df, call_dot), // parity terms don't depend on Heston params
+        OptionType::Put  => (call_val - seq + k*df, call_dot), // parity terms don't depend on Heston params
     }
 }
 
@@ -702,11 +707,15 @@ fn forward_pass(
     // CF(-i) normalizer (as a dual, so its derivative w.r.t. the active
     // param is also propagated into P1). includes the jump factor too,
     // same as bates_call's cf_mi.
+    //
+    // CF drift is r-q, not r — same defect and fix as heston_call (the payoff
+    // below discounts the stock leg by e^{-qT}, the CF must carry the q).
+    let mu = r - q;
     let phi_mi = Complex::new(Dual::constant(0.0), Dual::constant(-1.0));
-    let cf_mi = stable_cf_dual(phi_mi, t, r, &dp) * jump_factor(phi_mi, t, jump);
+    let cf_mi = stable_cf_dual(phi_mi, t, mu, &dp) * jump_factor(phi_mi, t, jump);
 
-    let (i1_val, i1_dot) = gk_integrate_dual(|u| dual_integrand(u, x, t, r, &dp, true, Some(cf_mi), jump));
-    let (i2_val, i2_dot) = gk_integrate_dual(|u| dual_integrand(u, x, t, r, &dp, false, None, jump));
+    let (i1_val, i1_dot) = gk_integrate_dual(|u| dual_integrand(u, x, t, mu, &dp, true, Some(cf_mi), jump));
+    let (i2_val, i2_dot) = gk_integrate_dual(|u| dual_integrand(u, x, t, mu, &dp, false, None, jump));
 
     let pi     = std::f64::consts::PI;
     let p1_val = 0.5 + i1_val / pi;

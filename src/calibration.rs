@@ -299,6 +299,10 @@ pub struct GlobalCalibResult<P = HestonParams> {
 
 const DE_F:  f64 = 0.6; // differential weight, classic DE/rand/1/bin default range is 0.4-1.0
 const DE_CR: f64 = 0.9; // crossover probability
+// fitness penalty per quote whose model price can't be IV-inverted (see sse_of).
+// vol-space residuals top out around 10 vol points -> ~1e2 SSE per quote, so
+// 1e3 per failed quote dominates any realistic fit-quality difference.
+const DE_FAIL_PENALTY: f64 = 1e3;
 
 // a genuine population-based global search (differential evolution,
 // DE/rand/1/bin), not repeated local restarts. doesn't need an initial
@@ -358,7 +362,19 @@ fn calibrate_global<M: CalibModel>(
     let sse_of = |v: &[f64]| -> f64 {
         let m = M::from_vec(v);
         if !m.bounds_ok() { return f64::INFINITY; }
-        weighted_sse(&residuals(quotes, &m), &base_weights)
+        let (res, mask) = residuals_and_mask(quotes, &m);
+        let n_fail = mask.iter().filter(|&&mk| mk == 0.0).count();
+        // a quote the model can't even price/invert must not read as residual
+        // 0 ("perfectly fit"): without this, DE's tournament selection loves
+        // regions where EVERY quote fails (SSE identically 0) and returns a
+        // parameter point that prices options at their no-arbitrage bounds.
+        // all-fail is infeasible outright; partial failures pay a penalty per
+        // quote that dwarfs any realistic vol-space SSE, so fewer failures
+        // always win, and a quote failing everywhere just shifts all fitness
+        // by the same constant.
+        if n_fail == quotes.len() { return f64::INFINITY; }
+        let w: Vec<f64> = base_weights.iter().zip(mask.iter()).map(|(bw, mk)| bw * mk).collect();
+        weighted_sse(&res, &w) + DE_FAIL_PENALTY * n_fail as f64
     };
 
     let mut init_rng = SmallRng::seed_from_u64(splitmix64(seed));
@@ -444,8 +460,8 @@ fn calibrate_inner<M: CalibModel>(
     // when reg is active. the pseudo-Jacobian block is just 1/scale on the
     // diagonal, constant in p since the penalty is linear, no FD/AD needed.
     let augmented_residuals = |m: &M| -> (Vec<f64>, Vec<f64>) {
-        let mut res = residuals(quotes, m);
-        let mut w   = base_weights.clone();
+        let (mut res, mask) = residuals_and_mask(quotes, m);
+        let mut w: Vec<f64> = base_weights.iter().zip(mask.iter()).map(|(bw, mk)| bw * mk).collect();
         if let Some(r) = reg {
             let pv = m.to_vec();
             let priorv = r.prior.to_vec();
@@ -556,13 +572,21 @@ fn calibrate_inner<M: CalibModel>(
     // supports, both because the prior is quietly doing the work, not the
     // quotes. regularization is allowed to change WHERE you land, not what
     // you're told about how well-supported that landing spot is by the data.
-    let res_data = residuals(quotes, &m);
-    let wmse     = weighted_sse(&res_data, &base_weights) / base_weights.iter().map(|w| w*w).sum::<f64>();
+    let (res_data, mask) = residuals_and_mask(quotes, &m);
+    let w_data: Vec<f64> = base_weights.iter().zip(mask.iter()).map(|(w, mk)| w * mk).collect();
+    // masked weights drop failed quotes from numerator AND denominator, so
+    // rmse stays an honest average over the quotes that actually have a
+    // residual. all-failed -> INFINITY, not a silent 0/0 NaN or a fake 0.
+    let sum_w2   = w_data.iter().map(|w| w*w).sum::<f64>();
+    let wmse     = if sum_w2 > 0.0 { weighted_sse(&res_data, &w_data) / sum_w2 } else { f64::INFINITY };
     let rmse     = wmse.sqrt();
-    let max_err  = res_data.iter().map(|r| r.abs()).fold(0.0_f64, f64::max);
+    let max_err  = res_data.iter().zip(mask.iter())
+        .filter(|(_, mk)| **mk > 0.0)
+        .map(|(r, _)| r.abs())
+        .fold(0.0_f64, f64::max);
 
     let final_j = jacobian::<M>(quotes, &m);
-    let (final_jtj, _) = jtj_and_grad(&final_j, &res_data, &base_weights, n);
+    let (final_jtj, _) = jtj_and_grad(&final_j, &res_data, &w_data, n);
     let (eigenvalues, eigenvectors) = jacobi_eigen(&final_jtj, n);
     let max_eig = eigenvalues.iter().cloned().fold(f64::MIN, f64::max);
     let min_eig = eigenvalues.iter().cloned().fold(f64::MAX, f64::min);
@@ -577,15 +601,15 @@ fn calibrate_inner<M: CalibModel>(
 }
 
 // residual for one option: iv_model(p) - iv_market.
-// returns 0.0 if the pricer or iv solver bails, don't let one bad quote blow up the fit.
-fn single_residual<M: CalibModel>(contract: &OptionContract, iv_mkt: f64, p: &M) -> f64 {
+// None when the pricer or iv solver bails. callers must NOT treat that as a
+// zero residual: 0.0 means "perfect fit" to the LM machinery, which silently
+// rewards exactly the quotes the model can't even price. failed quotes are
+// masked out (weight 0) instead, see residuals_and_mask.
+fn single_residual<M: CalibModel>(contract: &OptionContract, iv_mkt: f64, p: &M) -> Option<f64> {
     let px = p.price(contract);
     // need a contract with a vol field to run the iv solver, use iv_mkt as placeholder
     let c_for_iv = OptionContract { vol: iv_mkt, ..*contract };
-    match implied_vol(&IvProblem { contract: c_for_iv, market_price: px }) {
-        Some(iv) => iv - iv_mkt,
-        None     => 0.0,
-    }
+    implied_vol(&IvProblem { contract: c_for_iv, market_price: px }).map(|iv| iv - iv_mkt)
 }
 
 // parallel across quotes. every residual is an independent CF integration plus an IV
@@ -596,10 +620,17 @@ fn single_residual<M: CalibModel>(contract: &OptionContract, iv_mkt: f64, p: &M)
 // calibrate_* call has exactly one restart, so without this the whole calibration runs
 // on a single core no matter what RAYON_NUM_THREADS says. rayon nests safely via
 // work-stealing, so the multistart paths keep working unchanged.
-fn residuals<M: CalibModel>(quotes: &[CalibInput], p: &M) -> Vec<f64> {
+// returns (residuals, validity mask). failed quotes get residual 0.0 AND
+// mask 0.0: multiplying the mask into the weights removes them from the SSE,
+// the gradient, J'J and the rmse denominator alike, instead of counting them
+// as perfectly fit.
+fn residuals_and_mask<M: CalibModel>(quotes: &[CalibInput], p: &M) -> (Vec<f64>, Vec<f64>) {
     quotes.par_iter()
-        .map(|q| single_residual(q.contract, q.iv_market, p))
-        .collect()
+        .map(|q| match single_residual(q.contract, q.iv_market, p) {
+            Some(r) => (r, 1.0),
+            None    => (0.0, 0.0),
+        })
+        .unzip()
 }
 
 fn weighted_sse(res: &[f64], weights: &[f64]) -> f64 {
@@ -658,10 +689,13 @@ fn jacobian<M: CalibModel>(quotes: &[CalibInput], p: &M) -> Vec<Vec<f64>> {
         let h = vu[col] - vd[col];
         if h <= 0.0 { continue; } // pinned against both bounds, leave column zero
 
-        let ru = residuals(quotes, &M::from_vec(&vu));
-        let rd = residuals(quotes, &M::from_vec(&vd));
+        let (ru, mu) = residuals_and_mask(quotes, &M::from_vec(&vu));
+        let (rd, md) = residuals_and_mask(quotes, &M::from_vec(&vd));
         for row in 0..quotes.len() {
-            j[row][col] = (ru[row] - rd[row]) / h;
+            // a failed bump used to read as residual 0.0, turning this into
+            // (ru - 0)/h or (0 - 0)/h: a garbage or empty derivative. no
+            // valid pair -> no information, leave the entry at 0.
+            j[row][col] = if mu[row] > 0.0 && md[row] > 0.0 { (ru[row] - rd[row]) / h } else { 0.0 };
         }
     }
     j
@@ -1175,8 +1209,8 @@ mod tests {
                     "sigma_j" => { vu.sigma_j += h; vd.sigma_j -= h; }
                     _ => unreachable!(),
                 }
-                let ru = single_residual(q.contract, q.iv_market, &vu);
-                let rd = single_residual(q.contract, q.iv_market, &vd);
+                let ru = single_residual(q.contract, q.iv_market, &vu).expect("iv inversion failed at bumped-up params in test");
+                let rd = single_residual(q.contract, q.iv_market, &vd).expect("iv inversion failed at bumped-down params in test");
                 let fd = (ru - rd) / (2.0 * h);
                 let actual = j_actual[row][col];
                 let err = (actual - fd).abs() / fd.abs().max(1e-6);

@@ -88,7 +88,11 @@ pub fn black76_price_and_greeks(
     let delta = phi * er * nd1;
     let gamma = er * npd1 / (fwd * vt);
     let vega  = fwd * er * npd1 * expiry.sqrt();
-    let theta = er * (-fwd*npd1*vol/(2.0*expiry.sqrt()) - phi*rate*(fwd*nd1 - strike*nd2));
+    // carry sign: same defect theta_calc had, see the comment there. for F held
+    // fixed, theta = -e^{-rT} F phi(d1) sigma/(2 sqrt(T)) + r*price, and
+    // phi*rate*(fwd*nd1 - strike*nd2) = r*price/er. the old minus doubled the
+    // discount term instead of cancelling it (error = exactly 2*r*price).
+    let theta = er * (-fwd*npd1*vol/(2.0*expiry.sqrt()) + phi*rate*(fwd*nd1 - strike*nd2));
     // fwd is exogenous here, not spot*e^{(r-q)T}, so the only r-dependence in price
     // is the discount factor out front. rho = d(price)/dr = -T*price. the old
     // phi*strike*expiry*er*nd2 was BSM's rho pasted in, it's missing the fwd*nd1 term.

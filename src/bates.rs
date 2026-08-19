@@ -52,11 +52,17 @@ fn bates_call(s: f64, k: f64, t: f64, r: f64, q: f64, bp: &BatesParams) -> f64 {
     let x  = (s/k).ln();
 
     // CF(-i) normalizer for P1, including the jump component.
+    //
+    // the CF drift is r-q, not r — same defect and same fix as heston_call
+    // (see the comment there): the payoff below discounts the stock leg by
+    // e^{-qT}, so a q-free drift computes P1/P2 in a world without dividends
+    // and then discounts as if there were some.
+    let mu = r - q;
     let phi_mi = Complex64::new(0.0, -1.0);
-    let cf_mi  = stable_cf(phi_mi, t, r, &bp.heston) * jump_cf(phi_mi, t, bp);
+    let cf_mi  = stable_cf(phi_mi, t, mu, &bp.heston) * jump_cf(phi_mi, t, bp);
 
-    let i1 = gk_integrate(|u| bates_integrand(u, x, t, r, bp, true, Some(cf_mi)));
-    let i2 = gk_integrate(|u| bates_integrand(u, x, t, r, bp, false, None));
+    let i1 = gk_integrate(|u| bates_integrand(u, x, t, mu, bp, true, Some(cf_mi)));
+    let i2 = gk_integrate(|u| bates_integrand(u, x, t, mu, bp, false, None));
     let p1 = 0.5 + i1 / std::f64::consts::PI;
     let p2 = 0.5 + i2 / std::f64::consts::PI;
     (s*(-q*t).exp()*p1 - k*(-r*t).exp()*p2).max(0.0)
