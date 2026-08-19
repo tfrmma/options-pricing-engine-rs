@@ -107,9 +107,9 @@ fn heston_call(s: f64, k: f64, t: f64, r: f64, q: f64, p: &HestonParams) -> f64 
     (s*(-q*t).exp()*p1 - k*(-r*t).exp()*p2).max(0.0)
 }
 
-fn cf_integrand(u: f64, x: f64, t: f64, r: f64, p: &HestonParams, is_p1: bool, cf_mi: Option<Complex64>) -> f64 {
+fn cf_integrand(u: f64, x: f64, t: f64, mu: f64, p: &HestonParams, is_p1: bool, cf_mi: Option<Complex64>) -> f64 {
     let phi = if is_p1 { Complex64::new(u, -1.0) } else { Complex64::new(u, 0.0) };
-    let mut cf  = stable_cf(phi, t, r, p);
+    let mut cf  = stable_cf(phi, t, mu, p);
     if let Some(norm) = cf_mi {
         cf /= norm;
     }
@@ -119,7 +119,13 @@ fn cf_integrand(u: f64, x: f64, t: f64, r: f64, p: &HestonParams, is_p1: bool, c
 
 // Albrecher stable form. the g/(g-1) ratio avoids the log branch-cut issue
 // that makes the original Heston formula blow up for longer maturities.
-pub(crate) fn stable_cf(phi: Complex64, t: f64, r: f64, p: &HestonParams) -> Complex64 {
+//
+// `mu` is the risk-neutral drift of ln S over the life, i.e. r - q, NOT the
+// bare rate. passing r with a nonzero dividend yield silently reprices the
+// q = 0 world — the exact defect d88a1ff/d15aaa5 had to fix at three
+// separate call sites because this parameter used to be named `r` and read
+// like it wanted the rate.
+pub(crate) fn stable_cf(phi: Complex64, t: f64, mu: f64, p: &HestonParams) -> Complex64 {
     let i = Complex64::i();
     let &HestonParams { v0, kappa, theta, sigma, rho } = p;
 
@@ -132,7 +138,7 @@ pub(crate) fn stable_cf(phi: Complex64, t: f64, r: f64, p: &HestonParams) -> Com
     let c  = (kappa*theta / (sigma*sigma)) * ((xi - d)*t - 2.0*a.ln());
     let dd = v0 * (xi - d) * (1.0 - edt) / (sigma*sigma * (1.0 - g*edt));
 
-    (r * phi * i * t + c + dd).exp()
+    (mu * phi * i * t + c + dd).exp()
 }
 
 // num-complex's Complex64::sqrt() general branch goes through to_polar()/

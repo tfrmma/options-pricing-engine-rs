@@ -68,9 +68,9 @@ fn bates_call(s: f64, k: f64, t: f64, r: f64, q: f64, bp: &BatesParams) -> f64 {
     (s*(-q*t).exp()*p1 - k*(-r*t).exp()*p2).max(0.0)
 }
 
-fn bates_integrand(u: f64, x: f64, t: f64, r: f64, bp: &BatesParams, is_p1: bool, cf_mi: Option<Complex64>) -> f64 {
+fn bates_integrand(u: f64, x: f64, t: f64, mu: f64, bp: &BatesParams, is_p1: bool, cf_mi: Option<Complex64>) -> f64 {
     let phi = if is_p1 { Complex64::new(u, -1.0) } else { Complex64::new(u, 0.0) };
-    let mut cf  = stable_cf(phi, t, r, &bp.heston) * jump_cf(phi, t, bp);
+    let mut cf  = stable_cf(phi, t, mu, &bp.heston) * jump_cf(phi, t, bp);
     if let Some(norm) = cf_mi {
         cf /= norm;
     }

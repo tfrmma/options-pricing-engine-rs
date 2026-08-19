@@ -48,6 +48,13 @@ pub struct CalibResult<P = HestonParams> {
     pub iters:         usize,
     pub converged:     bool,
     pub early_stopped: bool,  // pruned by multistart before finishing, see PRUNE_FACTOR
+    // quotes whose IV inversion failed at the FINAL params. rmse/max_err
+    // average over the OTHER quotes only (failed ones are masked out of
+    // numerator and denominator, not scored as 0), so a nonzero count means
+    // those numbers describe a subset of the quote set — check it before
+    // trusting an impressive rmse. multistart winner selection sorts by this
+    // before rmse for the same reason.
+    pub n_failed:      usize,
 
     // identifiability diagnostic, computed from J'J's eigendecomposition at
     // the final params. a LARGE condition_number means some direction in
@@ -240,9 +247,14 @@ pub fn calibrate_bates_regularized(
 // behind a mutex, and every 10 iterations a restart checks it against its
 // own current SSE. more than PRUNE_FACTOR times worse than the best any
 // OTHER restart has found gets aborted (early_stopped=true, not counted as
-// converged). this can only ever kill a restart that's already losing, it
-// never changes which restart wins, it just stops paying for LM iterations
-// and Jacobian evaluations on a run that was never going to catch up.
+// converged). the SSEs on both sides of that comparison carry the same
+// (weight*FAIL_RESIDUAL)^2 charge per unpriceable quote that LM step
+// acceptance uses, and the final winner sorts by n_failed before rmse, so a
+// restart can neither prune others nor win by wandering somewhere quotes
+// stop being priceable. under that shared objective pruning still only
+// kills a restart that's already losing, it just stops paying for LM
+// iterations and Jacobian evaluations on a run that was never going to
+// catch up.
 pub fn calibrate_heston_multistart(
     quotes: &[CalibInput], p0: HestonParams, n_restarts: usize, seed: u64,
 ) -> MultistartResult {
@@ -284,8 +296,12 @@ fn calibrate_multistart<M: CalibModel>(
 
     let n_converged = results.iter().filter(|r| r.converged).count();
     let n_pruned     = results.iter().filter(|r| r.early_stopped).count();
+    // fewer failed quotes beats a better rmse: each restart's rmse averages
+    // over only the quotes IT could price, so comparing raw rmse across
+    // restarts would let one look great by failing the hard quotes out of
+    // its own denominator.
     let best = results.into_iter()
-        .min_by(|a, b| a.rmse.total_cmp(&b.rmse))
+        .min_by(|a, b| a.n_failed.cmp(&b.n_failed).then_with(|| a.rmse.total_cmp(&b.rmse)))
         .expect("n_restarts >= 1, there's always a best");
 
     MultistartResult { best, n_restarts, n_converged, n_pruned }
@@ -293,16 +309,16 @@ fn calibrate_multistart<M: CalibModel>(
 
 pub struct GlobalCalibResult<P = HestonParams> {
     pub best:           CalibResult<P>, // after DE search + LM polish
-    pub de_best_sse:    f64,            // SSE of the DE winner, pre-polish
+    // fitness of the DE winner, pre-polish: weighted data SSE over the quotes
+    // it could price, plus (weight*FAIL_RESIDUAL)^2 per quote it couldn't.
+    // NOT a pure vol-space SSE whenever anything failed inversion — check
+    // best.n_failed before comparing this against a polished rmse or across runs.
+    pub de_best_sse:    f64,
     pub de_generations: usize,
 }
 
 const DE_F:  f64 = 0.6; // differential weight, classic DE/rand/1/bin default range is 0.4-1.0
 const DE_CR: f64 = 0.9; // crossover probability
-// fitness penalty per quote whose model price can't be IV-inverted (see sse_of).
-// vol-space residuals top out around 10 vol points -> ~1e2 SSE per quote, so
-// 1e3 per failed quote dominates any realistic fit-quality difference.
-const DE_FAIL_PENALTY: f64 = 1e3;
 
 // a genuine population-based global search (differential evolution,
 // DE/rand/1/bin), not repeated local restarts. doesn't need an initial
@@ -363,18 +379,16 @@ fn calibrate_global<M: CalibModel>(
         let m = M::from_vec(v);
         if !m.bounds_ok() { return f64::INFINITY; }
         let (res, mask) = residuals_and_mask(quotes, &m);
-        let n_fail = mask.iter().filter(|&&mk| mk == 0.0).count();
         // a quote the model can't even price/invert must not read as residual
         // 0 ("perfectly fit"): without this, DE's tournament selection loves
         // regions where EVERY quote fails (SSE identically 0) and returns a
         // parameter point that prices options at their no-arbitrage bounds.
-        // all-fail is infeasible outright; partial failures pay a penalty per
-        // quote that dwarfs any realistic vol-space SSE, so fewer failures
-        // always win, and a quote failing everywhere just shifts all fitness
-        // by the same constant.
-        if n_fail == quotes.len() { return f64::INFINITY; }
-        let w: Vec<f64> = base_weights.iter().zip(mask.iter()).map(|(bw, mk)| bw * mk).collect();
-        weighted_sse(&res, &w) + DE_FAIL_PENALTY * n_fail as f64
+        // all-fail is infeasible outright; partial failures pay the same
+        // per-quote, weight-commensurate charge every other fit comparison
+        // uses, see FAIL_RESIDUAL.
+        if n_failed(&mask) == quotes.len() { return f64::INFINITY; }
+        let w = masked_weights(&base_weights, &mask);
+        weighted_sse(&res, &w) + fail_penalty(&base_weights, &mask)
     };
 
     let mut init_rng = SmallRng::seed_from_u64(splitmix64(seed));
@@ -459,9 +473,18 @@ fn calibrate_inner<M: CalibModel>(
     // appends n Tikhonov pseudo-rows to (res, weights) or (jacobian rows)
     // when reg is active. the pseudo-Jacobian block is just 1/scale on the
     // diagonal, constant in p since the penalty is linear, no FD/AD needed.
-    let augmented_residuals = |m: &M| -> (Vec<f64>, Vec<f64>) {
+    // returns (residuals, weights, objective). the objective is the weighted
+    // SSE plus (weight*FAIL_RESIDUAL)^2 per quote that failed inversion. step
+    // acceptance compares objectives across DIFFERENT failure masks, and
+    // without that charge a step that pushes a hard quote past the IV solver
+    // deletes the quote's (w*r)^2 from the sum outright — LM gets rewarded
+    // for walking into regions where quotes stop being priceable (extreme
+    // case: all quotes fail, SSE reads 0, the step "wins"), the exact defect
+    // the DE fitness already had to fix.
+    let augmented_residuals = |m: &M| -> (Vec<f64>, Vec<f64>, f64) {
         let (mut res, mask) = residuals_and_mask(quotes, m);
-        let mut w: Vec<f64> = base_weights.iter().zip(mask.iter()).map(|(bw, mk)| bw * mk).collect();
+        let mut w = masked_weights(&base_weights, &mask);
+        let penalty = fail_penalty(&base_weights, &mask);
         if let Some(r) = reg {
             let pv = m.to_vec();
             let priorv = r.prior.to_vec();
@@ -471,7 +494,8 @@ fn calibrate_inner<M: CalibModel>(
                 w.push(rw);
             }
         }
-        (res, w)
+        let sse = weighted_sse(&res, &w) + penalty;
+        (res, w, sse)
     };
     let augmented_jacobian = |m: &M| -> Vec<Vec<f64>> {
         let mut j = jacobian::<M>(quotes, m);
@@ -487,8 +511,7 @@ fn calibrate_inner<M: CalibModel>(
 
     let mut p   = p0.to_vec();
     let mut lam = LM_INIT;
-    let (mut res, mut weights) = augmented_residuals(&M::from_vec(&p));
-    let mut sse = weighted_sse(&res, &weights);
+    let (mut res, mut weights, mut sse) = augmented_residuals(&M::from_vec(&p));
 
     let mut iters         = 0;
     let mut converged     = false;
@@ -528,14 +551,19 @@ fn calibrate_inner<M: CalibModel>(
         // guess, reporting iters == MAX_ITER. that reads like "still working" when it
         // means "stuck since iteration 3", and the resulting rmse is just the fit
         // quality of the initial guess.
+        //
+        // bail BEFORE raising, not after: raising first and then breaking on
+        // `lam >= LM_MAX` aborts without ever computing the step at LM_MAX
+        // itself, one lambda-decade short of the ladder it claims to climb.
+        // the max-damped (smallest) step is exactly the one most likely to
+        // stay inside the constraint box, so it gets its one try.
         if !m_new.bounds_ok() {
-            lam = (lam * LM_UP).min(LM_MAX);
             if lam >= LM_MAX { break; }
+            lam = (lam * LM_UP).min(LM_MAX);
             continue;
         }
 
-        let (res_new, weights_new) = augmented_residuals(&m_new);
-        let sse_new = weighted_sse(&res_new, &weights_new);
+        let (res_new, weights_new, sse_new) = augmented_residuals(&m_new);
 
         if sse_new < sse {
             // good step
@@ -556,9 +584,10 @@ fn calibrate_inner<M: CalibModel>(
                 break;
             }
         } else {
-            // bad step, increase damping and retry with same params
-            lam = (lam * LM_UP).min(LM_MAX);
+            // bad step, increase damping and retry with same params. same
+            // bail-before-raise order as the bounds branch above.
             if lam >= LM_MAX { break; }
+            lam = (lam * LM_UP).min(LM_MAX);
         }
     }
 
@@ -573,7 +602,8 @@ fn calibrate_inner<M: CalibModel>(
     // quotes. regularization is allowed to change WHERE you land, not what
     // you're told about how well-supported that landing spot is by the data.
     let (res_data, mask) = residuals_and_mask(quotes, &m);
-    let w_data: Vec<f64> = base_weights.iter().zip(mask.iter()).map(|(w, mk)| w * mk).collect();
+    let nf     = n_failed(&mask);
+    let w_data = masked_weights(&base_weights, &mask);
     // masked weights drop failed quotes from numerator AND denominator, so
     // rmse stays an honest average over the quotes that actually have a
     // residual. all-failed -> INFINITY, not a silent 0/0 NaN or a fake 0.
@@ -584,6 +614,11 @@ fn calibrate_inner<M: CalibModel>(
         .filter(|(_, mk)| **mk > 0.0)
         .map(|(r, _)| r.abs())
         .fold(0.0_f64, f64::max);
+
+    // a zero gradient over an empty (fully-masked) quote set is not
+    // convergence: if nothing was priceable at the final point, the TOL_GRAD
+    // exit above fired on no information at all.
+    if nf == quotes.len() { converged = false; }
 
     let final_j = jacobian::<M>(quotes, &m);
     let (final_jtj, _) = jtj_and_grad(&final_j, &res_data, &w_data, n);
@@ -596,7 +631,7 @@ fn calibrate_inner<M: CalibModel>(
 
     CalibResult {
         params: m, rmse, max_err, iters, converged, early_stopped,
-        condition_number, weakest_direction,
+        n_failed: nf, condition_number, weakest_direction,
     }
 }
 
@@ -635,6 +670,64 @@ fn residuals_and_mask<M: CalibModel>(quotes: &[CalibInput], p: &M) -> (Vec<f64>,
 
 fn weighted_sse(res: &[f64], weights: &[f64]) -> f64 {
     res.iter().zip(weights.iter()).map(|(r, w)| (w * r).powi(2)).sum()
+}
+
+// vol-space residual charged for a quote the model can't price/invert,
+// shared by every fit comparison (DE fitness, LM step acceptance, multistart
+// pruning). commensurate with the weighted SSE it joins: a failed quote
+// costs (weight * FAIL_RESIDUAL)^2, i.e. exactly as much as misfitting that
+// same quote by FAIL_RESIDUAL vols. 5.0 sits far above any real vol residual
+// (market IVs live under ~2.0), so failing is never the cheap way out — and
+// unlike the flat 1e3 it replaces, it can neither be undercut by a heavily
+// 1/vega-weighted quote (at w > ~316 the flat charge was cheaper than
+// fitting a 0.1-vol residual) nor dwarf everything at weight 1 (1e3 was
+// ~1e5x a realistic per-quote SSE: 10 vol points is 0.1, SSE 0.01, not the
+// ~1e2 the old comment claimed).
+const FAIL_RESIDUAL: f64 = 5.0;
+
+fn n_failed(mask: &[f64]) -> usize {
+    mask.iter().filter(|&&mk| mk == 0.0).count()
+}
+
+// THE place mask semantics get folded into weights. this used to be three
+// hand-copied `bw * mk` zips (DE fitness, LM residuals, final metrics), each
+// with its own mask idiom — one forgotten copy away from "failed quote =
+// perfect fit" all over again.
+fn masked_weights(base: &[f64], mask: &[f64]) -> Vec<f64> {
+    base.iter().zip(mask.iter()).map(|(w, mk)| w * mk).collect()
+}
+
+fn fail_penalty(base: &[f64], mask: &[f64]) -> f64 {
+    base.iter().zip(mask.iter())
+        .filter(|(_, mk)| **mk == 0.0)
+        .map(|(w, _)| (w * FAIL_RESIDUAL).powi(2))
+        .sum()
+}
+
+#[cfg(test)]
+mod mask_objective_tests {
+    use super::*;
+
+    // failing a quote must never be cheaper than fitting it badly, at any
+    // weight. the flat 1e3 predecessor lost this above w ~ 316 (1/vega
+    // weights on short-dated wings live there) and was ~1e5x too big at w=1.
+    #[test]
+    fn fail_penalty_dominates_any_real_misfit_at_every_weight() {
+        for w in [0.05_f64, 1.0, 50.0, 500.0] {
+            let worst_real = 2.0_f64; // market IVs live under ~200 vol points
+            let fit_cost   = (w * worst_real).powi(2);
+            let fail_cost  = fail_penalty(&[w], &[0.0]);
+            assert!(fail_cost > fit_cost, "w={w}: fail {fail_cost} <= fit {fit_cost}");
+        }
+    }
+
+    #[test]
+    fn masked_weights_zero_out_failed_quotes_only() {
+        let w = masked_weights(&[2.0, 3.0, 4.0], &[1.0, 0.0, 1.0]);
+        assert_eq!(w, vec![2.0, 0.0, 4.0]);
+        assert_eq!(n_failed(&[1.0, 0.0, 1.0]), 1);
+        assert_eq!(fail_penalty(&[2.0, 3.0, 4.0], &[1.0, 1.0, 1.0]), 0.0);
+    }
 }
 
 // converts an exact d(price)/d(param) into d(iv)/d(param) via the implicit

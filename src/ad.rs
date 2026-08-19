@@ -175,7 +175,8 @@ fn cln(z: CDual) -> CDual {
 // identical structure to stable_cf in heston.rs. if you change the formula
 // there, change it here too. yes, this is the price of manual AD.
 
-fn stable_cf_dual(phi: CDual, t: f64, r: f64, p: &DualParams) -> CDual {
+// `mu` = risk-neutral drift of ln S = r - q, same contract as stable_cf.
+fn stable_cf_dual(phi: CDual, t: f64, mu: f64, p: &DualParams) -> CDual {
     let i   = cd_i();
     let c   = |v: f64| Complex::new(Dual::constant(v), Dual::constant(0.0));
     let cd_param = |d: Dual| Complex::new(d, Dual::constant(0.0));
@@ -191,7 +192,7 @@ fn stable_cf_dual(phi: CDual, t: f64, r: f64, p: &DualParams) -> CDual {
     let dd  = cd_param(p.v0) * (xi - d) * (one - edt)
             / (cd_param(p.sigma * p.sigma) * (one - g * edt));
 
-    cexp(c(r * t) * phi * i + cc + dd)
+    cexp(c(mu * t) * phi * i + cc + dd)
 }
 
 // jump component, mirrors jump_cf in bates.rs exactly. lambda/mu_j/sigma_j
@@ -419,7 +420,8 @@ fn dual_params5(p: &HestonParams) -> DualParams5 {
 // simultaneously (each in its own orthogonal direction) instead of one at
 // a time. same formula, verified by construction (mechanical port), not
 // just by inspection, see forward_pass5_matches_five_scalar_passes.
-fn stable_cf_dual5(phi: CDual5, t: f64, r: f64, p: &DualParams5) -> CDual5 {
+// `mu` = risk-neutral drift of ln S = r - q, same contract as stable_cf.
+fn stable_cf_dual5(phi: CDual5, t: f64, mu: f64, p: &DualParams5) -> CDual5 {
     let i = cd5_i();
     let DualParams5 { v0, kappa, theta, sigma, rho } = *p;
     let rt = |v: Dual5| Complex::new(v, Dual5::constant(0.0));
@@ -434,7 +436,7 @@ fn stable_cf_dual5(phi: CDual5, t: f64, r: f64, p: &DualParams5) -> CDual5 {
     let c  = rt(kappa)*rt(theta) / (rt(sigma)*rt(sigma)) * ((xi - d)*cd5(t,0.0) - cln5(a)*cd5(2.0,0.0));
     let dd = rt(v0) * (xi - d) * (one - edt) / (rt(sigma)*rt(sigma) * (one - g*edt));
 
-    cexp5(cd5(r,0.0)*phi*i*cd5(t,0.0) + c + dd)
+    cexp5(cd5(mu,0.0)*phi*i*cd5(t,0.0) + c + dd)
 }
 
 // one joint forward pass, all 5 Heston-param derivatives at once. same
@@ -561,27 +563,30 @@ pub fn heston_greeks_ad5(
                + crate::heston::heston_price(spot-ds, strike, expiry, rate, div_yield, params, opt_type))
               / (ds*ds);
 
-    let t_dn  = (expiry - 1.0/365.0).max(1e-6);
-    let theta = (crate::heston::heston_price(spot, strike, t_dn, rate, div_yield, params, opt_type) - price) / (1.0/365.0);
+    // theta/vanna/volga: same shared step rules as heston_greeks_ad, see the
+    // comments there (central_theta and vol_bump_levels live in greeks.rs).
+    let theta = crate::greeks::central_theta(expiry, |t|
+        crate::heston::heston_price(spot, strike, t, rate, div_yield, params, opt_type));
 
     let dr = 1e-4;
     let rho_greek = (crate::heston::heston_price(spot, strike, expiry, rate+dr, div_yield, params, opt_type)
                     - crate::heston::heston_price(spot, strike, expiry, rate-dr, div_yield, params, opt_type))
                    / (2.0*dr);
 
-    let p_vup = HestonParams { v0: (vol+0.01).powi(2), ..*params };
-    let p_vdn = HestonParams { v0: (vol-0.01).max(1e-6).powi(2), ..*params };
+    let (v_up, v_dn, v_span) = crate::greeks::vol_bump_levels(vol, 1.0);
+    let p_vup = HestonParams { v0: v_up.powi(2), ..*params };
+    let p_vdn = HestonParams { v0: v_dn.powi(2), ..*params };
     let delta_vup = (crate::heston::heston_price(spot+ds, strike, expiry, rate, div_yield, &p_vup, opt_type)
                     - crate::heston::heston_price(spot-ds, strike, expiry, rate, div_yield, &p_vup, opt_type)) / (2.0*ds);
     let delta_vdn = (crate::heston::heston_price(spot+ds, strike, expiry, rate, div_yield, &p_vdn, opt_type)
                     - crate::heston::heston_price(spot-ds, strike, expiry, rate, div_yield, &p_vdn, opt_type)) / (2.0*ds);
-    let vanna = (delta_vup - delta_vdn) / (2.0*0.01);
+    let vanna = (delta_vup - delta_vdn) / v_span;
 
     let (_, d_vup) = forward_pass5(spot, strike, expiry, rate, div_yield, &p_vup, opt_type);
     let (_, d_vdn) = forward_pass5(spot, strike, expiry, rate, div_yield, &p_vdn, opt_type);
-    let vega_up = d_vup[0] * 2.0 * (vol+0.01);
-    let vega_dn = d_vdn[0] * 2.0 * (vol-0.01).max(1e-6);
-    let volga = (vega_up - vega_dn) / (2.0*0.01);
+    let vega_up = d_vup[0] * 2.0 * v_up;
+    let vega_dn = d_vdn[0] * 2.0 * v_dn;
+    let volga = (vega_up - vega_dn) / v_span;
 
     PricingResult { price, delta, gamma, vega, theta, rho: rho_greek, vanna, volga }
 }
@@ -612,7 +617,7 @@ fn dual_params(p: &HestonParams, active: usize) -> DualParams {
 // one level of indirection away for no real benefit at a call site this hot.
 #[allow(clippy::too_many_arguments)]
 fn dual_integrand(
-    u: f64, x: f64, t: f64, r: f64,
+    u: f64, x: f64, t: f64, mu: f64,
     dp: &DualParams, is_p1: bool, cf_mi: Option<CDual>, jump: JumpSpec,
 ) -> (f64, f64) {
     let phi: CDual = if is_p1 {
@@ -621,7 +626,7 @@ fn dual_integrand(
         Complex::new(Dual::constant(u), Dual::constant(0.0))
     };
 
-    let mut cf  = stable_cf_dual(phi, t, r, dp);
+    let mut cf  = stable_cf_dual(phi, t, mu, dp);
     cf = cf * jump_factor(phi, t, jump);
     if let Some(norm) = cf_mi {
         cf = cf / norm;
@@ -772,31 +777,36 @@ pub fn heston_greeks_ad(
     let delta = (p_sup - p_sdn) / (2.0 * ds);
     let gamma = (p_sup - 2.0*price + p_sdn) / (ds * ds);
 
-    // theta: FD on expiry
-    let t_dn  = (expiry - 1.0/365.0).max(1e-6);
-    let theta = (crate::heston::heston_price(spot, strike, t_dn, rate, div_yield, params, opt_type) - price)
-              / (1.0/365.0);
+    // theta: FD on expiry. central difference with the shrinking step from
+    // greeks.rs — one implementation shared with the bump-and-reprice path so
+    // the two public APIs can't disagree again (the one-sided form this used
+    // to carry overstated 1-DTE theta ~1.9x after greeks.rs was fixed).
+    let theta = crate::greeks::central_theta(expiry, |t|
+        crate::heston::heston_price(spot, strike, t, rate, div_yield, params, opt_type));
 
-    // vanna: cross bump delta vs vol
-    let p_vup = HestonParams { v0: (vol + 0.01).powi(2), ..*params };
-    let p_vdn = HestonParams { v0: (vol - 0.01).max(1e-6).powi(2), ..*params };
+    // vanna: cross bump delta vs vol. bump levels and realized span from
+    // greeks.rs too: the fixed 2*0.01 denominator understated vanna/volga
+    // whenever the lower bump clamped (and 0/0'd at v0 = 0).
+    let (v_up, v_dn, v_span) = crate::greeks::vol_bump_levels(vol, 1.0);
+    let p_vup = HestonParams { v0: v_up.powi(2), ..*params };
+    let p_vdn = HestonParams { v0: v_dn.powi(2), ..*params };
     let delta_vup = (crate::heston::heston_price(spot+ds, strike, expiry, rate, div_yield, &p_vup, opt_type)
                    - crate::heston::heston_price(spot-ds, strike, expiry, rate, div_yield, &p_vup, opt_type))
                   / (2.0 * ds);
     let delta_vdn = (crate::heston::heston_price(spot+ds, strike, expiry, rate, div_yield, &p_vdn, opt_type)
                    - crate::heston::heston_price(spot-ds, strike, expiry, rate, div_yield, &p_vdn, opt_type))
                   / (2.0 * ds);
-    let vanna = (delta_vup - delta_vdn) / (2.0 * 0.01);
-    // volga: FD on vega. second-order AD would be cleaner but overkill for now.
+    let vanna = (delta_vup - delta_vdn) / v_span;
+    // volga: FD on the AD vega. second-order AD would be cleaner but overkill for now.
     let vega_up = {
         let (_, dv0_up) = forward_pass(spot, strike, expiry, rate, div_yield, &p_vup, opt_type, 0, JumpSpec::Off);
-        dv0_up * 2.0 * (vol + 0.01)
+        dv0_up * 2.0 * v_up
     };
     let vega_dn = {
         let (_, dv0_dn) = forward_pass(spot, strike, expiry, rate, div_yield, &p_vdn, opt_type, 0, JumpSpec::Off);
-        dv0_dn * 2.0 * (vol - 0.01).max(1e-6)
+        dv0_dn * 2.0 * v_dn
     };
-    let volga = (vega_up - vega_dn) / (2.0 * 0.01);
+    let volga = (vega_up - vega_dn) / v_span;
 
     let _ = (dkappa, dtheta, dsigma, drho); // available for calibration gradient if needed
 
@@ -844,29 +854,31 @@ pub fn bates_greeks_ad(
     let delta = (p_sup - p_sdn) / (2.0 * ds);
     let gamma = (p_sup - 2.0*price + p_sdn) / (ds * ds);
 
-    let t_dn  = (expiry - 1.0/365.0).max(1e-6);
-    let theta = (crate::bates::bates_price(spot, strike, t_dn, rate, div_yield, &bp, opt_type) - price)
-              / (1.0/365.0);
+    // theta/vanna/volga: same shared step rules as heston_greeks_ad, see the
+    // comments there (central_theta and vol_bump_levels live in greeks.rs).
+    let theta = crate::greeks::central_theta(expiry, |t|
+        crate::bates::bates_price(spot, strike, t, rate, div_yield, &bp, opt_type));
 
-    let bp_vup = crate::types::BatesParams { heston: HestonParams { v0: (vol + 0.01).powi(2), ..*heston }, ..bp };
-    let bp_vdn = crate::types::BatesParams { heston: HestonParams { v0: (vol - 0.01).max(1e-6).powi(2), ..*heston }, ..bp };
+    let (v_up, v_dn, v_span) = crate::greeks::vol_bump_levels(vol, 1.0);
+    let bp_vup = crate::types::BatesParams { heston: HestonParams { v0: v_up.powi(2), ..*heston }, ..bp };
+    let bp_vdn = crate::types::BatesParams { heston: HestonParams { v0: v_dn.powi(2), ..*heston }, ..bp };
     let delta_vup = (crate::bates::bates_price(spot+ds, strike, expiry, rate, div_yield, &bp_vup, opt_type)
                    - crate::bates::bates_price(spot-ds, strike, expiry, rate, div_yield, &bp_vup, opt_type))
                   / (2.0 * ds);
     let delta_vdn = (crate::bates::bates_price(spot+ds, strike, expiry, rate, div_yield, &bp_vdn, opt_type)
                    - crate::bates::bates_price(spot-ds, strike, expiry, rate, div_yield, &bp_vdn, opt_type))
                   / (2.0 * ds);
-    let vanna = (delta_vup - delta_vdn) / (2.0 * 0.01);
+    let vanna = (delta_vup - delta_vdn) / v_span;
 
     let vega_up = {
         let (_, dv0_up) = forward_pass(spot, strike, expiry, rate, div_yield, &bp_vup.heston, opt_type, 0, jump);
-        dv0_up * 2.0 * (vol + 0.01)
+        dv0_up * 2.0 * v_up
     };
     let vega_dn = {
         let (_, dv0_dn) = forward_pass(spot, strike, expiry, rate, div_yield, &bp_vdn.heston, opt_type, 0, jump);
-        dv0_dn * 2.0 * (vol - 0.01).max(1e-6)
+        dv0_dn * 2.0 * v_dn
     };
-    let volga = (vega_up - vega_dn) / (2.0 * 0.01);
+    let volga = (vega_up - vega_dn) / v_span;
 
     let _ = (dkappa, dtheta, dsigma, drho);
 
@@ -1136,14 +1148,14 @@ mod tests {
             HestonParams { v0: 0.03 + 0.002*f, kappa: 1.8 + 0.05*f, theta: 0.03 + 0.001*f, sigma: 0.28 + 0.01*f, rho: -0.7 + 0.01*f }
         }).collect();
         let dual_sets: Vec<DualParams> = param_sets.iter().map(|p| dual_params(p, 0)).collect();
-        let (t, r) = (1.0, 0.05);
+        let (t, mu) = (1.0, 0.05); // mu = drift (r - q), q = 0 here; timing only
 
         let n = 100_000;
         let t_plain = bench_varying(n, &(0..param_sets.len()).collect::<Vec<_>>(), |idx| {
             let p = &param_sets[idx];
             let mut acc = Complex64::new(0.0, 0.0);
             for &node in GK_NODES.iter() {
-                acc += stable_cf(Complex64::new(node, -1.0), t, r, p);
+                acc += stable_cf(Complex64::new(node, -1.0), t, mu, p);
             }
             acc
         });
@@ -1154,7 +1166,7 @@ mod tests {
             let dp = &dual_sets[idx];
             let mut acc = Complex::new(Dual::constant(0.0), Dual::constant(0.0));
             for &node in GK_NODES.iter() {
-                acc = acc + stable_cf_dual(Complex::new(Dual::constant(node), Dual::constant(-1.0)), t, r, dp);
+                acc = acc + stable_cf_dual(Complex::new(Dual::constant(node), Dual::constant(-1.0)), t, mu, dp);
             }
             acc
         });
