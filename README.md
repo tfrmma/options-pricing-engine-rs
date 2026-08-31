@@ -9,6 +9,7 @@ License: MIT. See [LICENSE](LICENSE).
 ## Contents
 
 - [Models](#models)
+- [Rough Bergomi (work in progress)](#rough-bergomi-work-in-progress)
 - [Design](#design)
 - [Build](#build)
 - [Usage](#usage)
@@ -28,8 +29,21 @@ License: MIT. See [LICENSE](LICENSE).
 | Bates (1996) | Heston CF × Merton (1976) log-normal jump CF | Bump-and-reprice (`bates_price_and_greeks`), or forward-mode AD (`bates_greeks_ad`) |
 | Local Vol (Dupire 1994) | Fritsch-Butland monotone cubic spline, differentiated through the spline, not the raw grid | Numerical (local vol surface) |
 | Monte Carlo (Heston/Bates) | Full truncation Euler (default) or Andersen (2008) QE, exact per-step Poisson jump counts, antithetic variates | N/A, path-dependent payoffs only (European, Asian, up-and-out barrier) |
+| Rough Bergomi (Bayer, Friz, Gatheral 2016) | Monte Carlo via the hybrid scheme (Bennedsen, Lunde, Pakkanen 2017), κ=2, FFT tail convolution | N/A. Only `Payoff::European` is validated so far, see [Rough Bergomi](#rough-bergomi-work-in-progress) |
 
 All five analytic models share the same `OptionContract`/`PricingResult` conventions where applicable, so switching models in a caller doesn't mean rewriting the call site.
+
+## Rough Bergomi (work in progress)
+
+`mc_rough_bergomi` in `mc.rs` is a real, usable pricer now: hybrid scheme (κ=2) for the near-kernel Wiener integrals via the Σ/Cholesky from commit 1, FFT tail convolution (`realfft`) for the far Riemann sum, mapped through the rBergomi variance formula (Bayer, Friz, Gatheral 2016, section 3.3) against a `ForwardVarianceCurve`, Euler-integrated log-price sharing the same `McConfig`/`Payoff`/`McResult` types as the Heston/Bates Monte Carlo pricer. Only `Payoff::European` has been validated end to end so far, `AsianArithmetic`/`UpAndOut` go through the same code path (same `payoff.eval` call as `run_path`) but haven't been specifically tested against a rough-vol path, don't assume they're correct just because the enum accepts them.
+
+`ForwardVarianceCurve` and `RoughBergomiParams` (`types.rs`) are the two public types. The forward variance curve is piecewise-constant between listed expiries, deliberately not flat: it's arb-free by construction, not by a repair pass, strictly positive variance times strictly ascending expiries makes cumulative total variance strictly increasing, no calendar-arb check needed the way `local_vol.rs` needs one for the full (K,T) surface, this is 1D and ATM-only, there's no butterfly dimension to fight. Bootstrapping it from market ATM quotes isn't implemented yet, callers construct it directly.
+
+The FFT plan and the Γ tail weights (`b*_k`-derived) are built once per `mc_rough_bergomi` call, outside the `rayon` path loop, and shared read-only across every path, not rebuilt per path, that was the whole point of using an FFT here instead of the O(N²) direct sum. RNG generation stays in `mc.rs` (same `box_muller`/`splitmix64` as Heston/Bates), everything downstream in `rbergomi.rs` is a pure function of the raw normals, which makes `simulate_variance_and_dz` directly unit-testable without an RNG in the loop, see the exact-variance test below.
+
+Still missing: the deep-calibration surrogate (offline-trained tiny MLP, hand-rolled Rust inference, no ONNX runtime for a ~5.6k-parameter network), bootstrapping `ForwardVarianceCurve` from market quotes, the skew power-law and Cholesky-benchmark-smile validation tests from the paper's own section 3.3 (what exists now checks the discretization scheme's own internal consistency, not yet how well it reproduces the specific smile in Table 1), and `AsianArithmetic`/`UpAndOut` validation against a rough-vol path specifically.
+
+All formulas checked against arXiv:1507.03004v4 directly, not from memory and not from a secondary writeup, see [References](#references). Two things worth calling out. First: `hyp2f1_matches_numeric_quadrature` initially passed with a plain equally-spaced Simpson quadrature that silently carried ~0.7% error from the integrable singularity at the interval endpoint, caught by cross-checking against an independent arbitrary-precision implementation (mpmath), not by inspection, fixed with a substitution, now agrees to 3e-7. Second: `variance_of_simulated_y_matches_exact_scheme_variance` doesn't test against the paper's asymptotic MSE result (Theorem 2.5/Corollary 2.7), that convergence is genuinely slow for α near -0.5 (rate ~n^{-(α+1/2)+ε}, which at α=-0.43 is close to n^{-0.07}) and would need an impractically large `n_steps` to pin down tightly in a fast test. Instead it checks Var(Yn(t)) against a closed form derived from the discretization scheme's *own* definition (near and far terms touch disjoint step indices with nonzero weight, so they're independent, no cross-covariance term needed), which is exact at any `n_steps` and isolates implementation bugs from the scheme's own, already-proven-in-the-paper approximation error.
 
 ## Design
 
@@ -176,7 +190,7 @@ let bgreeks = batch_bates_greeks(&chain, &bp0);
 
 ## Testing
 
-82 tests, `cargo test --release`, all synchronous and deterministic (no timing-dependent assertions, the Monte Carlo tests use a fixed seed and check convergence against the analytic price within a multiple of the MC's own reported standard error, not a fixed tolerance). A further 6 profiling benchmarks are marked `#[ignore]` since they measure timing, not correctness, run them with `cargo test --release -- --ignored --nocapture --test-threads=1 ad::tests::profile`.
+93 tests, `cargo test --release`, all synchronous and deterministic (no timing-dependent assertions, the Monte Carlo tests use a fixed seed and check convergence against the analytic price within a multiple of the MC's own reported standard error, not a fixed tolerance). A further 6 profiling benchmarks are marked `#[ignore]` since they measure timing, not correctness, run them with `cargo test --release -- --ignored --nocapture --test-threads=1 ad::tests::profile`.
 
 | Module | Tests | Covers |
 |---|---:|---|
@@ -184,7 +198,8 @@ let bgreeks = batch_bates_greeks(&chain, &bp0);
 | `local_vol` | 13 | Flat-surface recovery, spline no-overshoot, calendar/butterfly detection and repair, multi-pass cascading repair, non-uniform grid curvature, spline-vs-raw-FD divergence on a kinked surface |
 | `ad` | 15 | Heston and Bates price match their analytic pricers to 1e-6 across strikes and expiries including the short-dated wings that broke the old fixed-panel quadrature, vega within 1% of bump-and-reprice for both, Bates AD collapses to Heston AD when jumps are off, dual `csqrt` matches the builtin value and a finite-difference derivative across a sweep concentrated near the branch cut, jump-parameter sensitivities match FD on the analytic Bates pricer, `Dual5` (the multi-directional experiment) matches the scalar `Dual` path on every Greek across the same wings grid, sign checks |
 | `heston` | 9 | Put-call parity, sign checks, Feller condition, BSM limit (σ→0), no-static-arbitrage across a strike/expiry grid, `fast_csqrt` matches `Complex64::sqrt()` across 680+ swept points including near-axis angles down to 1e-12 radians |
-| `mc` | 7 | European MC matches analytic Heston/Bates within a z-score bound on the MC's own standard error (both schemes), Asian call cheaper than European (real inequality), up-and-out cheaper than vanilla with zero rebate (real inequality), QE cuts bias ~20x vs Euler in a Feller-violating coarse-step regime, Poisson sampler mean check |
+| `rbergomi` | 9 | Hybrid scheme covariance Σ matches the Itô isometry at Σ₁,₁, symmetric, Cholesky reconstructs it exactly, stays positive definite down to α=-0.49 (H≈0.01, closer to the crypto short-dated regime than the paper's own H=0.07 test case), scales with n at the rate the paper predicts, optimal evaluation points b*_k land inside their cell, the 2F1 series matches an independent singularity-regularized quadrature, the FFT tail convolution matches an independent direct O(N²) sum, Var(Yn(t)) matches a closed form derived from the scheme's own definition (see [Rough Bergomi](#rough-bergomi-work-in-progress)) |
+| `mc` | 9 | European MC matches analytic Heston/Bates within a z-score bound on the MC's own standard error (both schemes), Asian call cheaper than European (real inequality), up-and-out cheaper than vanilla with zero rebate (real inequality), QE cuts bias ~20x vs Euler in a Feller-violating coarse-step regime, Poisson sampler mean check, rBergomi forward is a martingale (strike=0 call = E[disc·S_T] = S_0 exactly, by construction) within a z-score bound, rBergomi converges to Black-Scholes as η→0 |
 | `bates` | 6 | Recovers Heston when jump intensity is zero, put-call parity, sign checks, no-static-arbitrage |
 | `batch` | 5 | Batch price matches scalar calls, batch IV round-trips, batch Heston/Bates Greeks match scalar `PricingResult` field-by-field, batch price-only output agrees with batch Greeks output |
 | `bsm` | 4 | Put-call parity, sign checks, Black-76 sanity vs BSM, Black-76 rho vs finite difference |
@@ -212,6 +227,7 @@ Qualitatively: BSM is closed-form and embarrassingly parallel, Heston and Bates 
 - Bates' identifiability problem now has a diagnostic (`condition_number`/`weakest_direction` on every `CalibResult`) and a mitigation (`calibrate_*_regularized`), but neither makes the underlying issue go away. The diagnostic tells you a fit is untrustworthy, it doesn't tell you the *right* answer. Regularization pulls toward a prior you supply, if that prior is wrong the regularized result is just confidently wrong in a different direction, garbage in, garbage out still applies. `reg_weight` has no universally correct value, and there's no automatic way to pick one, that's still on the caller.
 - QE (`VarianceScheme::QuadraticExponential`) implements Andersen's base scheme (his eq 33), not the martingale-corrected QE-M variant. Andersen's own paper treats QE (not QE-M) as the practical default, so this isn't a shortcut, but QE-M exists as a further refinement nobody's ported.
 - `heston_greeks_ad5` proves multi-directional dual arithmetic is a real ~3x win at the integration level (measured, `profile_dual5_vs_five_scalar_passes`), but doesn't flip the headline number: `heston_greeks_ad`/`ad5`/`bates_greeks_ad` are still slower than bump-and-reprice overall (~1.3-1.5x) because delta/gamma/theta/rho/vanna/volga are still FD-bumped regardless of which path computes vega. Extending the `Dual5`-style joint pass to cover spot and rate too (not just the 5 Heston CF params) is the next step this result points to, not done here.
+- Rough Bergomi (`rbergomi.rs`, `mc_rough_bergomi` in `mc.rs`) prices vanilla European options, no calibration surrogate yet and `AsianArithmetic`/`UpAndOut` are untested against it, see [Rough Bergomi (work in progress)](#rough-bergomi-work-in-progress) for exactly what exists and what's still missing.
 - CI (`.github/workflows/ci.yml`) pins the toolchain to 1.75.0, the exact version everything here was verified clean against (`cargo build --release --all-targets`, full test suite, `cargo clippy --release --all-targets -- -D warnings`). Bumping it is fine, but re-run clippy locally against the new toolchain first, new Rust releases add new clippy lints and "stable" drifting out from under you is exactly how a previously-green CI starts failing on code nobody touched.
 
 ## Dependencies
@@ -222,6 +238,7 @@ num-traits    trait bounds for Complex<Dual> in the AD path
 rayon         parallel batch pricing, Monte Carlo paths, and multistart calibration
 rand          RNG for Monte Carlo paths, DE population init, and multistart restarts (SmallRng, seeded per unit of parallel work)
 libm          erfc for full-precision ncdf
+realfft       real-to-complex FFT for the rough Bergomi hybrid scheme's tail convolution (wraps rustfft, pulled in transitively)
 ```
 
 No `ndarray`, no `nalgebra`, no linear algebra crate, the calibration Jacobian is a 5x5 (Heston) or 8x8 (Bates) system solved by hand-rolled Gaussian elimination, not worth pulling in a dependency for at this size.
@@ -247,3 +264,5 @@ No `ndarray`, no `nalgebra`, no linear algebra crate, the calibration Jacobian i
 - Lord, R., Koekkoek, R., van Dijk, D. (2010). *A Comparison of Biased Simulation Schemes for Stochastic Volatility Models.* (full truncation Euler scheme used by the Monte Carlo engine)
 - Andersen, L. (2008). *Efficient Simulation of the Heston Stochastic Volatility Model.* (QE scheme, `VarianceScheme::QuadraticExponential`)
 - Knuth, D. E. (1969). *The Art of Computer Programming, Volume 2: Seminumerical Algorithms.* (exact Poisson sampling used for per-step jump counts)
+- Bennedsen, M., Lunde, A., Pakkanen, M. S. (2017). *Hybrid scheme for Brownian semistationary processes.* Finance and Stochastics 21(4). (the hybrid scheme kernel implemented in `rbergomi.rs`)
+- Bayer, C., Friz, P., Gatheral, J. (2016). *Pricing under rough volatility.* Quantitative Finance 16(6). (the rough Bergomi model itself, target of the hybrid scheme's option-pricing experiment)
