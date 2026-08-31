@@ -23,7 +23,7 @@
 use rand::{Rng, SeedableRng};
 use rand::rngs::SmallRng;
 use rayon::prelude::*;
-use crate::types::{HestonParams, OptionType};
+use crate::types::{HestonParams, OptionType, RoughBergomiParams, ForwardVarianceCurve};
 
 #[derive(Debug, Clone, Copy)]
 pub struct McResult {
@@ -277,6 +277,129 @@ fn run_path(
     disc * payoff.eval(terminal, running_sum, running_max, steps.len())
 }
 
+// --- rough Bergomi -----------------------------------------------------
+//
+// structurally different from mc_price/run_path above: the far-kernel term
+// isn't a per-step recurrence, it's one FFT convolution over the whole path
+// (rbergomi.rs::simulate_variance_and_dz), so this can't reuse draw_step /
+// run_path as-is. RNG generation stays here (mc.rs already owns box_muller),
+// everything downstream of the raw normals is a pure function in rbergomi.rs.
+
+// 4 iid N(0,1) per step: 3 feed the Cholesky-correlated (W^n_i, W^n_i1,
+// W^n_i2) block, 1 is the independent W-perp shock for Z. same
+// precompute-then-replay-negated pattern as StepDraw, needed for antithetic
+// to actually pair against the same underlying draws instead of fresh ones.
+struct RbergomiDraws { z0: Vec<f64>, z1: Vec<f64>, z2: Vec<f64>, zperp: Vec<f64> }
+
+fn draw_rbergomi_path<R: Rng>(rng: &mut R, n_steps: usize) -> RbergomiDraws {
+    let mut z0 = vec![0.0; n_steps];
+    let mut z1 = vec![0.0; n_steps];
+    let mut z2 = vec![0.0; n_steps];
+    let mut zperp = vec![0.0; n_steps];
+    for i in 0..n_steps {
+        let (a, b) = box_muller(rng);
+        z0[i] = a; z1[i] = b;
+        let (c, d) = box_muller(rng);
+        z2[i] = c; zperp[i] = d;
+    }
+    RbergomiDraws { z0, z1, z2, zperp }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_rbergomi_path(
+    spot: f64, drift0: f64, v: &[f64], dz: &[f64], dt: f64,
+    payoff: &Payoff, rate: f64, expiry: f64,
+) -> f64 {
+    let mut ln_s = spot.ln();
+    let mut running_sum = 0.0;
+    let mut running_max = spot;
+
+    for i in 0..v.len() {
+        let vi = v[i].max(0.0); // v is exp(...) > 0 by construction, max(0.0) is just a guard against a garbage curve/param combo upstream
+        ln_s += (drift0 - 0.5 * vi) * dt + vi.sqrt() * dz[i];
+        let s = ln_s.exp();
+        running_sum += s;
+        running_max = running_max.max(s);
+    }
+
+    let terminal = ln_s.exp();
+    let disc = (-rate * expiry).exp();
+    disc * payoff.eval(terminal, running_sum, running_max, v.len())
+}
+
+// no jump term, rBergomi doesn't have one in the paper's formulation and
+// nothing here asked for one, add a Bates-style jump-diffusion overlay as
+// its own commit if that's ever needed rather than bolting it on here.
+#[allow(clippy::too_many_arguments)]
+pub fn mc_rough_bergomi(
+    spot: f64, expiry: f64, rate: f64, div_yield: f64,
+    params: &RoughBergomiParams, curve: &ForwardVarianceCurve,
+    payoff: Payoff, cfg: &McConfig,
+) -> McResult {
+    let dt = expiry / cfg.n_steps as f64;
+    let n  = 1.0 / dt;
+    let alpha = params.alpha();
+    let drift0 = rate - div_yield;
+
+    // built once, shared read-only across every path below, not per-path,
+    // see rbergomi.rs's module note on why that matters here specifically.
+    let sigma = crate::rbergomi::hybrid_scheme_covariance(alpha, 2, n);
+    let l = crate::rbergomi::cholesky_lower(&sigma, 3).unwrap_or_else(|| {
+        panic!("hybrid scheme Sigma not positive definite for alpha={alpha}, hurst should be in (0, 0.5)")
+    });
+    let plan  = crate::rbergomi::build_conv_plan(cfg.n_steps);
+    let gamma = crate::rbergomi::build_gamma(alpha, cfg.n_steps, n);
+
+    let n_threads = rayon::current_num_threads().max(1);
+    let paths_per_pair = if cfg.antithetic { 2 } else { 1 };
+    let n_pairs_total = cfg.n_paths / paths_per_pair;
+    let chunk_size = (n_pairs_total / n_threads).max(1);
+
+    let (sum, sum_sq, count): (f64, f64, usize) = (0..n_threads)
+        .into_par_iter()
+        .map(|chunk_idx| {
+            let start = chunk_idx * chunk_size;
+            let end   = if chunk_idx == n_threads - 1 { n_pairs_total } else { (start + chunk_size).min(n_pairs_total) };
+            if start >= end { return (0.0, 0.0, 0usize); }
+
+            let mut rng = SmallRng::seed_from_u64(splitmix64(cfg.seed ^ chunk_idx as u64));
+            let mut local_sum = 0.0;
+            let mut local_sum_sq = 0.0;
+            let mut local_count = 0usize;
+
+            for _ in start..end {
+                let draws = draw_rbergomi_path(&mut rng, cfg.n_steps);
+
+                let (v, dz) = crate::rbergomi::simulate_variance_and_dz(
+                    params, curve, dt, &l, &plan, &gamma,
+                    &draws.z0, &draws.z1, &draws.z2, &draws.zperp, 1.0);
+                let payoff_main = run_rbergomi_path(spot, drift0, &v, &dz, dt, &payoff, rate, expiry);
+                local_sum += payoff_main;
+                local_sum_sq += payoff_main * payoff_main;
+                local_count += 1;
+
+                if cfg.antithetic {
+                    let (v2, dz2) = crate::rbergomi::simulate_variance_and_dz(
+                        params, curve, dt, &l, &plan, &gamma,
+                        &draws.z0, &draws.z1, &draws.z2, &draws.zperp, -1.0);
+                    let payoff_anti = run_rbergomi_path(spot, drift0, &v2, &dz2, dt, &payoff, rate, expiry);
+                    local_sum += payoff_anti;
+                    local_sum_sq += payoff_anti * payoff_anti;
+                    local_count += 1;
+                }
+            }
+            (local_sum, local_sum_sq, local_count)
+        })
+        .reduce(|| (0.0, 0.0, 0usize), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2));
+
+    let n_f = count as f64;
+    let mean = sum / n_f;
+    let var = (sum_sq / n_f - mean * mean).max(0.0);
+    let std_error = (var / n_f).sqrt();
+
+    McResult { price: mean, std_error }
+}
+
 // Andersen (2008) quadratic-exponential step for the CIR variance process.
 // samples v_{t+dt} from a distribution moment-matched to the true
 // conditional distribution of the CIR process (quadratic-in-normal for
@@ -462,5 +585,52 @@ mod tests {
         let total: u64 = (0..n).map(|_| sample_poisson(&mut rng, mean) as u64).sum();
         let empirical_mean = total as f64 / n as f64;
         assert!((empirical_mean - mean).abs() < 0.01, "empirical={empirical_mean:.4} target={mean}");
+    }
+
+    fn rbergomi_small_cfg() -> McConfig {
+        McConfig { n_paths: 100_000, n_steps: 64, seed: 3, antithetic: true, scheme: VarianceScheme::FullTruncationEuler }
+    }
+
+    // (S_T - 0)^+ = S_T always (S_T > 0), so a strike=0 call's discounted
+    // price is exactly E[disc * S_T], which has to equal S(0) by
+    // construction of the stochastic exponential (the -1/2 v ds compensator
+    // in the paper's S(t) formula), for any eta/rho/hurst/curve. real
+    // martingale check on the full near+far+FFT pipeline together, not a
+    // vibe check on any one piece in isolation.
+    #[test]
+    fn rbergomi_forward_is_a_martingale() {
+        let params = RoughBergomiParams { eta: 1.9, rho: -0.9, hurst: 0.07 };
+        let curve = ForwardVarianceCurve::new(vec![0.5, 1.0, 2.0], vec![0.2, 0.25, 0.22]);
+        let (s, t, r, q) = (100.0, 0.5, 0.0, 0.0);
+
+        let mc = mc_rough_bergomi(s, t, r, q, &params, &curve,
+            Payoff::European { strike: 0.0, opt_type: OptionType::Call }, &rbergomi_small_cfg());
+
+        let z = (mc.price - s).abs() / mc.std_error;
+        assert!(z < 4.0, "price={:.4} spot={s} se={:.4} z={z:.2}", mc.price, mc.std_error);
+    }
+
+    // eta -> 0 collapses v(t) toward the deterministic curve xi0(t) (the
+    // stochastic term in the exponential vanishes), so the price should
+    // converge to plain Black-Scholes with vol = sqrt(xi0). cross-check
+    // against a completely different, already-tested pricer (bsm.rs), not
+    // against rBergomi's own machinery.
+    #[test]
+    fn rbergomi_matches_black_scholes_when_vol_of_vol_is_tiny() {
+        let params = RoughBergomiParams { eta: 0.001, rho: -0.9, hurst: 0.07 };
+        let xi0 = 0.04;
+        let curve = ForwardVarianceCurve::new(vec![2.0], vec![xi0]);
+        let (s, k, t, r, q) = (100.0, 100.0, 1.0, 0.05, 0.0);
+
+        let bs = crate::bsm::bsm_price(&crate::types::OptionContract {
+            spot: s, strike: k, expiry: t, rate: r, div_yield: q,
+            vol: xi0.sqrt(), opt_type: OptionType::Call,
+        });
+
+        let mc = mc_rough_bergomi(s, t, r, q, &params, &curve,
+            Payoff::European { strike: k, opt_type: OptionType::Call }, &rbergomi_small_cfg());
+
+        let z = (mc.price - bs).abs() / mc.std_error;
+        assert!(z < 4.0, "bs={bs:.4} mc={:.4} se={:.4} z={z:.2}", mc.price, mc.std_error);
     }
 }
