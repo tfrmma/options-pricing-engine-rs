@@ -17,6 +17,7 @@ num-traits = "0.2"
 rayon = "1.8"
 libm = "0.2"
 rand = { version = "0.8", features = ["small_rng"] }
+realfft = "3.5"
 
 [profile.release]
 opt-level = 3
