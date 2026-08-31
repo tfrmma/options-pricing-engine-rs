@@ -13,10 +13,12 @@ pub mod local_vol;
 pub mod mc;
 pub mod batch;
 pub mod calibration;
+pub mod rbergomi;
 
 // flatten the hot path to crate root
 pub use types::{OptionType, OptionContract, PricingResult, IvProblem,
-                HestonParams, BatesParams, LocalVolSurface};
+                HestonParams, BatesParams, LocalVolSurface,
+                RoughBergomiParams, ForwardVarianceCurve};
 pub use bsm::{bsm_price, bsm_price_and_greeks, black76_price_and_greeks};
 pub use iv::implied_vol;
 pub use heston::{heston_price, heston_price_and_greeks};
