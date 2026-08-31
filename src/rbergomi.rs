@@ -14,12 +14,19 @@
 // correction on top, so the near-term approximation in the paper's eq 2.4 is
 // exact equality here, not an approximation stacked on an approximation.
 //
-// formulas checked against arxiv 1507.03004v4 directly.
+// formulas checked against arxiv 1507.03004v4 directly, not from memory.
 //
-// nothing here is called outside this file's own tests yet, mc.rs wires it in
-// next commit. allow(dead_code) instead of leaving clippy -D warnings red for
-// a commit that's deliberately just the kernel.
-#![allow(dead_code)]
+// path simulation (this commit): Yn(t) is the T BSS variant (paper's eq 3.7),
+// sigma == 1 identically for rBergomi (the eta/vol-of-vol scaling happens
+// outside the integral, in the variance formula below, not inside the
+// kernel), so Xi_k = W^n_k, no separate vol-of-vol process to simulate for
+// the kernel itself. Gamma/gamma the tail convolution weights via the FFT
+// per Remark 3.1, kappa=2 near terms via the Sigma/Cholesky from this file.
+
+use crate::types::{ForwardVarianceCurve, RoughBergomiParams};
+use realfft::RealFftPlanner;
+use realfft::num_complex::Complex64;
+use std::sync::Arc;
 
 // Gauss hypergeometric 2F1(a, b, c, z), series definition, |z| < 1 only.
 // only ever called here with b=1, which collapses (b)_n/n! to 1, but kept
@@ -134,9 +141,230 @@ pub(crate) fn cholesky_lower(matrix: &[f64], dim: usize) -> Option<Vec<f64>> {
     Some(l)
 }
 
+// FFT plan for the tail convolution, built once per pricer call (see mc.rs's
+// mc_rough_bergomi) and shared read-only across every path via Arc clones,
+// not rebuilt per path. plan construction (twiddle factor tables) is the
+// expensive part, the actual per-path transform is cheap in comparison.
+pub(crate) struct ConvPlan {
+    fft_len: usize,
+    r2c: Arc<dyn realfft::RealToComplex<f64>>,
+    c2r: Arc<dyn realfft::ComplexToReal<f64>>,
+}
+
+pub(crate) fn build_conv_plan(path_len: usize) -> ConvPlan {
+    // zero-pad past 2*path_len-1 so the circular wraparound FFT convolution
+    // gives, lands outside the region we read, gives a real (non-circular)
+    // linear convolution back.
+    let fft_len = (2 * path_len - 1).next_power_of_two();
+    let mut planner = RealFftPlanner::<f64>::new();
+    ConvPlan {
+        fft_len,
+        r2c: planner.plan_fft_forward(fft_len),
+        c2r: planner.plan_fft_inverse(fft_len),
+    }
+}
+
+// linear (not circular) causal convolution, conv[m] = sum_{k=0}^{m} gamma[k]*xi[m-k],
+// m = 0..path_len-1. gamma and xi must both be exactly path_len long, zero-padded
+// internally to fft_len before transforming.
+pub(crate) fn convolve_causal(plan: &ConvPlan, gamma: &[f64], xi: &[f64]) -> Vec<f64> {
+    let path_len = gamma.len();
+    debug_assert_eq!(path_len, xi.len());
+
+    let mut a = vec![0.0; plan.fft_len];
+    let mut b = vec![0.0; plan.fft_len];
+    a[..path_len].copy_from_slice(gamma);
+    b[..path_len].copy_from_slice(xi);
+
+    let mut spec_a: Vec<Complex64> = plan.r2c.make_output_vec();
+    let mut spec_b: Vec<Complex64> = plan.r2c.make_output_vec();
+    plan.r2c.process(&mut a, &mut spec_a).expect("forward fft");
+    plan.r2c.process(&mut b, &mut spec_b).expect("forward fft");
+
+    for (x, y) in spec_a.iter_mut().zip(spec_b.iter()) {
+        *x *= y;
+    }
+
+    let mut out = vec![0.0; plan.fft_len];
+    plan.c2r.process(&mut spec_a, &mut out).expect("inverse fft");
+
+    // realfft doesn't normalize the inverse transform, that's on the caller.
+    let scale = 1.0 / plan.fft_len as f64;
+    out.truncate(path_len);
+    out.iter_mut().for_each(|v| *v *= scale);
+    out
+}
+
+// tail weights Gamma_k = g(b*_k/n), eq in Remark 3.1. Gamma_k = 0 for
+// k=1,2 (kappa=2, those are the exact near terms from Sigma instead),
+// index 0-based here: gamma[k-1] holds Gamma_k. same for every path at a
+// given (alpha, n_steps, n), build once outside the per-path loop.
+pub(crate) fn build_gamma(alpha: f64, path_len: usize, n: f64) -> Vec<f64> {
+    let mut gamma = vec![0.0; path_len];
+    for k in 3..=path_len {
+        let b_star = optimal_eval_point(alpha, k);
+        gamma[k - 1] = (b_star / n).powf(alpha);
+    }
+    gamma
+}
+
+// full variance path v(t_i), i=0..n_steps-1, plus the matching dZ increments
+// for the price process, eq 3.4/3.7 (near+far) folded into the rBergomi
+// variance formula from section 3.3. sign=-1.0 for the antithetic sibling,
+// negating the underlying normals negates every derived quantity here since
+// everything downstream (Cholesky, the convolution, Z) is linear in them.
+//
+// z0/z1/z2/zperp are raw iid N(0,1) draws, one point per step, RNG lives in
+// mc.rs (draw_rbergomi_step), this stays a pure function of its inputs.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn simulate_variance_and_dz(
+    params: &RoughBergomiParams, curve: &ForwardVarianceCurve, dt: f64,
+    l: &[f64], plan: &ConvPlan, gamma: &[f64],
+    z0: &[f64], z1: &[f64], z2: &[f64], zperp: &[f64], sign: f64,
+) -> (Vec<f64>, Vec<f64>) {
+    let n_steps = z0.len();
+    let alpha = params.alpha();
+    let sqrt_2a1 = (2.0 * alpha + 1.0).sqrt();
+    let sqdt = dt.sqrt();
+
+    let mut w_plain = vec![0.0; n_steps]; // W^n_i
+    let mut w1      = vec![0.0; n_steps]; // W^n_{i,1}
+    let mut w2      = vec![0.0; n_steps]; // W^n_{i,2}
+    let mut dz      = vec![0.0; n_steps];
+
+    for i in 0..n_steps {
+        let (a, b, c, d) = (sign * z0[i], sign * z1[i], sign * z2[i], sign * zperp[i]);
+        // L * (a,b,c), L lower-triangular flat 3x3 from cholesky_lower
+        let wi  = l[0] * a;
+        let wi1 = l[3] * a + l[4] * b;
+        let wi2 = l[6] * a + l[7] * b + l[8] * c;
+
+        w_plain[i] = wi;
+        w1[i] = wi1;
+        w2[i] = wi2;
+        dz[i] = params.rho * wi + (1.0 - params.rho * params.rho).sqrt() * d * sqdt;
+    }
+
+    let conv = convolve_causal(plan, gamma, &w_plain);
+
+    let mut v = vec![0.0; n_steps];
+    for i in 0..n_steps {
+        // Yn(i/n) = Ycheck (near, kappa=2) + Yhat (far, the convolution).
+        // min{i, kappa} per eq 3.7: i=0 has neither term, i=1 only the k=1 term.
+        let y_near = match i {
+            0 => 0.0,
+            1 => w1[0],
+            _ => w1[i - 1] + w2[i - 2],
+        };
+        let y_far = if i == 0 { 0.0 } else { conv[i - 1] };
+        let y = y_near + y_far;
+
+        let t = i as f64 * dt;
+        v[i] = curve.variance_at(t) * (params.eta * sqrt_2a1 * y - 0.5 * params.eta * params.eta * t.powf(2.0 * alpha + 1.0)).exp();
+    }
+
+    (v, dz)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::{Rng, SeedableRng};
+    use rand::rngs::SmallRng;
+
+    fn std_normal_pair<R: Rng>(rng: &mut R) -> (f64, f64) {
+        let u1: f64 = rng.gen_range(1e-12..1.0);
+        let u2: f64 = rng.gen();
+        let r = (-2.0 * u1.ln()).sqrt();
+        let theta = std::f64::consts::TAU * u2;
+        (r * theta.cos(), r * theta.sin())
+    }
+
+    #[test]
+    fn convolve_causal_matches_direct_sum() {
+        let plan  = build_conv_plan(6);
+        let gamma = vec![0.0, 0.0, 1.5, -0.7, 0.3, 2.1];
+        let xi    = vec![1.0, -2.0, 0.5, 3.0, -1.5, 0.8];
+
+        let fft_result = convolve_causal(&plan, &gamma, &xi);
+
+        let mut direct = [0.0; 6];
+        for m in 0..6 {
+            for k in 0..=m {
+                direct[m] += gamma[k] * xi[m - k];
+            }
+        }
+
+        for m in 0..6 {
+            assert!((fft_result[m] - direct[m]).abs() < 1e-9,
+                "m={m} fft={} direct={}", fft_result[m], direct[m]);
+        }
+    }
+
+    #[test]
+    fn variance_of_simulated_y_matches_exact_scheme_variance() {
+        // Yn(i/n) (the T BSS discretization, eq 3.7) is, by construction, an
+        // exact linear combination of the iid-across-steps (W^n_m, W^n_m1,
+        // W^n_m2) vectors. its variance UNDER THE SCHEME ITSELF (not the
+        // continuous-time process it approximates, that comparison converges
+        // much more slowly per Corollary 2.7 and isn't what this test is
+        // checking) has a closed form: the near term (steps i-1, i-2) and
+        // the far term (steps 0..i-3, weighted by Gamma_k which is exactly
+        // zero for k=1,2) touch disjoint step indices with nonzero weight,
+        // so they're independent, no cross term.
+        //   Var(Yn(i/n)) = Sigma_{2,2} + Sigma_{3,3} + sum_{k=3}^{i} Gamma_k^2 / n
+        // recovered empirically from the eta=1, flat xi0=1 variance path via
+        // Y = (ln(v) + 0.5 t^(2a+1)) / sqrt(2a+1).
+        let alpha = -0.43;
+        let n_steps = 60;
+        let dt = 1.0 / n_steps as f64;
+        let n = 1.0 / dt;
+
+        let params = RoughBergomiParams { eta: 1.0, rho: -0.5, hurst: alpha + 0.5 };
+        let curve = ForwardVarianceCurve::new(vec![1.0], vec![1.0]);
+
+        let sigma = hybrid_scheme_covariance(alpha, 2, n);
+        let l     = cholesky_lower(&sigma, 3).unwrap();
+        let plan  = build_conv_plan(n_steps);
+        let gamma = build_gamma(alpha, n_steps, n);
+
+        let check_i = 30usize;
+        let t_i = check_i as f64 * dt;
+
+        let exact_var = sigma[4] + sigma[8] // Sigma_{2,2}, Sigma_{3,3}: flat 3x3, (1,1)->4, (2,2)->8
+            + (3..=check_i).map(|k| gamma[k - 1].powi(2) / n).sum::<f64>();
+
+        let reps = 40_000;
+        let mut rng = SmallRng::seed_from_u64(11);
+        let (mut sum_y, mut sum_y2) = (0.0, 0.0);
+
+        for _ in 0..reps {
+            let mut z0 = vec![0.0; n_steps];
+            let mut z1 = vec![0.0; n_steps];
+            let mut z2 = vec![0.0; n_steps];
+            let mut zperp = vec![0.0; n_steps];
+            for i in 0..n_steps {
+                let (a, b) = std_normal_pair(&mut rng);
+                z0[i] = a; z1[i] = b;
+                let (c, d) = std_normal_pair(&mut rng);
+                z2[i] = c; zperp[i] = d;
+            }
+            let (v, _dz) = simulate_variance_and_dz(&params, &curve, dt, &l, &plan, &gamma,
+                &z0, &z1, &z2, &zperp, 1.0);
+            let y = (v[check_i].ln() + 0.5 * t_i.powf(2.0 * alpha + 1.0)) / (2.0 * alpha + 1.0).sqrt();
+            sum_y += y;
+            sum_y2 += y * y;
+        }
+
+        let mean_y = sum_y / reps as f64;
+        let empirical_var = sum_y2 / reps as f64 - mean_y * mean_y;
+
+        // se of a sample-variance estimator of a Gaussian target ~ var*sqrt(2/reps),
+        // 6-sigma band, generous but not infinite.
+        let se = exact_var * (2.0 / reps as f64).sqrt();
+        assert!((empirical_var - exact_var).abs() < 6.0 * se,
+            "empirical={empirical_var:.6} exact={exact_var:.6} se={se:.6}");
+    }
 
     // Table 1 in the paper, H=0.07. real crypto pre-event surfaces are
     // expected to be rougher than this, see the near-H-zero test below.
