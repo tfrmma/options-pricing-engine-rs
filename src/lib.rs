@@ -19,6 +19,7 @@ pub mod rbergomi;
 pub use types::{OptionType, OptionContract, PricingResult, IvProblem,
                 HestonParams, BatesParams, LocalVolSurface,
                 RoughBergomiParams, ForwardVarianceCurve};
+pub use rbergomi::{bootstrap_forward_variance_curve, CurveBootstrapError};
 pub use bsm::{bsm_price, bsm_price_and_greeks, black76_price_and_greeks};
 pub use iv::implied_vol;
 pub use heston::{heston_price, heston_price_and_greeks};
