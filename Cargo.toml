@@ -7,6 +7,10 @@ edition = "2021"
 name = "options_pricing_engine"
 path = "src/main.rs"
 
+[[bin]]
+name = "gen_rbergomi_dataset"
+path = "src/gen_rbergomi_dataset.rs"
+
 [lib]
 name = "options_pricing_engine"
 path = "src/lib.rs"
