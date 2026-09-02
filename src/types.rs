@@ -103,8 +103,9 @@ impl LocalVolSurface {
 // local_vol.rs needs one, this is 1D (ATM only), there's no butterfly dimension
 // to fight with.
 //
-// bootstrap-from-quotes isn't here yet, that's a separate commit, this is just
-// the curve type and lookup.
+// bootstrapped from ATM quotes by rbergomi::bootstrap_forward_variance_curve,
+// or constructed directly.
+#[derive(Debug)]
 pub struct ForwardVarianceCurve {
     pub expiries:  Vec<f64>,  // ascending, years, pillar dates
     pub variances: Vec<f64>,  // xi0 level for the bucket ending at expiries[i]
