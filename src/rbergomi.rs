@@ -128,7 +128,11 @@ pub(crate) fn cholesky_lower(matrix: &[f64], dim: usize) -> Option<Vec<f64>> {
                 sum -= l[i * dim + p] * l[j * dim + p];
             }
             if i == j {
-                if sum <= 0.0 {
+                // sum <= 0.0 is false when sum is NaN (IEEE 754 comparisons
+                // with NaN are always false), so a NaN pivot silently passed
+                // through as Some(garbage) with this written as sum <= 0.0.
+                // !(sum > 0.0) correctly catches both non-positive and NaN.
+                if sum.is_nan() || sum <= 0.0 {
                     return None;
                 }
                 l[i * dim + j] = sum.sqrt();
@@ -224,7 +228,6 @@ pub(crate) fn simulate_variance_and_dz(
 ) -> (Vec<f64>, Vec<f64>) {
     let n_steps = z0.len();
     let alpha = params.alpha();
-    let sqrt_2a1 = (2.0 * alpha + 1.0).sqrt();
     let sqdt = dt.sqrt();
 
     let mut w_plain = vec![0.0; n_steps]; // W^n_i
@@ -247,7 +250,8 @@ pub(crate) fn simulate_variance_and_dz(
 
     let conv = convolve_causal(plan, gamma, &w_plain);
 
-    let mut v = vec![0.0; n_steps];
+    let mut y = vec![0.0; n_steps];
+    let mut times = vec![0.0; n_steps];
     for i in 0..n_steps {
         // Yn(i/n) = Ycheck (near, kappa=2) + Yhat (far, the convolution).
         // min{i, kappa} per eq 3.7: i=0 has neither term, i=1 only the k=1 term.
@@ -257,12 +261,134 @@ pub(crate) fn simulate_variance_and_dz(
             _ => w1[i - 1] + w2[i - 2],
         };
         let y_far = if i == 0 { 0.0 } else { conv[i - 1] };
-        let y = y_near + y_far;
-
-        let t = i as f64 * dt;
-        v[i] = curve.variance_at(t) * (params.eta * sqrt_2a1 * y - 0.5 * params.eta * params.eta * t.powf(2.0 * alpha + 1.0)).exp();
+        y[i] = y_near + y_far;
+        times[i] = i as f64 * dt;
     }
 
+    let v = y_to_variance(&y, &times, params.eta, alpha, curve);
+    (v, dz)
+}
+
+// v(t) = xi0(t) * exp(eta*sqrt(2a+1)*Y(t) - eta^2/2 * t^(2a+1)), section 3.3.
+// single source of truth for the actual variance formula, shared by the fast
+// hybrid-scheme path above and the exact-covariance test reference below,
+// don't duplicate this arithmetic in a second place.
+fn y_to_variance(y: &[f64], times: &[f64], eta: f64, alpha: f64, curve: &ForwardVarianceCurve) -> Vec<f64> {
+    let sqrt_2a1 = (2.0 * alpha + 1.0).sqrt();
+    y.iter().zip(times).map(|(&yi, &t)| {
+        curve.variance_at(t) * (eta * sqrt_2a1 * yi - 0.5 * eta * eta * t.powf(2.0 * alpha + 1.0)).exp()
+    }).collect()
+}
+
+#[cfg(test)]
+// Y(t_i), i=0..m-1, sampled directly from the TRUE continuous-time process's
+// own covariance structure, Lemma 4.3, same closed form and same hyp2f1 as
+// the Sigma above, but no hybrid scheme, no FFT, no discretization
+// approximation of any kind beyond the Cholesky factorization's own float
+// error. O((2m)^3) to factor, fine at m ~ tens of steps for a benchmark,
+// not meant to scale, that's the whole point: this is the "obviously
+// correct but doesn't scale" reference the fast path gets checked against,
+// same spirit as the paper's own Figure 4.
+//
+// times[i] = i*dt, the START of the interval v[i] prices over, same
+// convention as the fast scheme (simulate_variance_and_dz), on purpose:
+// Y(times[i]) = int_0^{times[i]} (...) dW(s) structurally only depends on W
+// strictly before times[i], never on the interval [times[i], times[i]+dt)
+// it's about to price. First version of this used the END of each interval
+// instead, which meant Y(t_i) legitimately included that interval's own
+// Brownian shock, breaking the Euler discretization's "variance must be
+// predictable, known before the shock it scales" requirement, caught by a
+// diagnostic showing E[ln S_T] off by 10x more than Jensen's gap could
+// explain and realized variance ~3x too high, not by inspection.
+//
+// Y(times[0])=Y(0)=0 deterministically, no history yet, so it's excluded
+// from this matrix entirely rather than forced through Cholesky as a
+// zero-variance row (which correctly fails strict positive-definiteness,
+// that surfaced as the very next bug once the first one was fixed).
+// simulate_price_exact below fills it back in as a hardcoded 0.
+//
+// jointly covers the plain BM increments dW_j too (needed to drive the
+// price's Z process the same way the fast path does, correlated with the
+// same W that built Y), not just Y alone. layout: [0..m-1) = Y(times[1]..
+// times[m-1]), [m-1..2m-1) = dW_0..dW_{m-1}, dW_j spans [times[j],
+// times[j]+dt). Cov(Y(times[i]), dW_j) is nonzero only for j < i (dW_j's
+// whole interval has to end at or before t_i).
+pub(crate) fn exact_joint_covariance(alpha: f64, times: &[f64], dt: f64) -> Vec<f64> {
+    let m = times.len();
+    let ny = m - 1; // genuinely random Y points, excludes times[0]=0
+    let dim = ny + m;
+    let mut cov = vec![0.0; dim * dim];
+    let at = |i: usize, j: usize| i * dim + j;
+
+    for yi in 0..ny {
+        let ti = times[yi + 1];
+        cov[at(yi, yi)] = ti.powf(2.0 * alpha + 1.0) / (2.0 * alpha + 1.0);
+        for yj in (yi + 1)..ny {
+            let tj = times[yj + 1];
+            let c = ti.powf(alpha + 1.0) * tj.powf(alpha) / (alpha + 1.0)
+                * hyp2f1(-alpha, 1.0, alpha + 2.0, ti / tj);
+            cov[at(yi, yj)] = c;
+            cov[at(yj, yi)] = c;
+        }
+    }
+
+    for j in 0..m {
+        cov[at(ny + j, ny + j)] = dt;
+    }
+
+    for yi in 0..ny {
+        let ti = times[yi + 1];
+        for j in 0..(yi + 1) {
+            let tj = times[j];
+            let end_j = tj + dt;
+            // end_j <= ti always by construction, exactly equal at j=yi,
+            // where floating-point rounding (end_j computed as tj+dt, ti as
+            // a separate (yi+1)*dt) can push the difference a hair negative.
+            // powf on a negative base with a fractional exponent is NaN,
+            // not a tiny negative number, clamp it.
+            let tail = (ti - end_j).max(0.0);
+            let c = ((ti - tj).powf(alpha + 1.0) - tail.powf(alpha + 1.0)) / (alpha + 1.0);
+            cov[at(yi, ny + j)] = c;
+            cov[at(ny + j, yi)] = c;
+        }
+    }
+
+    cov
+}
+
+#[cfg(test)]
+// v(t) and dZ built from the exact joint draw above instead of the hybrid
+// scheme. no antithetic here, this is a correctness benchmark, not a
+// variance-reduced production path, keep it as simple as it can be.
+pub(crate) fn simulate_price_exact(
+    params: &RoughBergomiParams, curve: &ForwardVarianceCurve, times: &[f64], dt: f64,
+    l_joint: &[f64], z: &[f64], zperp: &[f64],
+) -> (Vec<f64>, Vec<f64>) {
+    let m = times.len();
+    let ny = m - 1;
+    let dim = ny + m;
+    let alpha = params.alpha();
+    let sqdt = dt.sqrt();
+
+    let mut draw = vec![0.0; dim];
+    for i in 0..dim {
+        let mut acc = 0.0;
+        for k in 0..=i {
+            acc += l_joint[i * dim + k] * z[k];
+        }
+        draw[i] = acc;
+    }
+
+    let mut y = vec![0.0; m]; // y[0] stays 0.0, Y(0)=0 deterministically
+    y[1..m].copy_from_slice(&draw[0..ny]);
+    let dw = &draw[ny..dim];
+
+    let v = y_to_variance(&y, times, params.eta, alpha, curve);
+
+    let mut dz = vec![0.0; m];
+    for j in 0..m {
+        dz[j] = params.rho * dw[j] + (1.0 - params.rho * params.rho).sqrt() * zperp[j] * sqdt;
+    }
     (v, dz)
 }
 
