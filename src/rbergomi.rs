@@ -280,6 +280,67 @@ fn y_to_variance(y: &[f64], times: &[f64], eta: f64, alpha: f64, curve: &Forward
     }).collect()
 }
 
+// what's wrong with the input quotes, precise enough to act on: which
+// expiry, and by how much.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CurveBootstrapError {
+    // duplicate or out-of-order expiry after sorting
+    NonAscendingExpiry { expiry: f64 },
+    // the bucket ending at this expiry implies non-positive forward
+    // variance, i.e. ATM total variance decreased going into it, calendar
+    // arbitrage in the raw quotes
+    NonPositiveImpliedVariance { expiry: f64, implied_xi0: f64 },
+}
+
+// bootstraps a piecewise-constant xi0(t) (ForwardVarianceCurve) from ATM
+// implied vol quotes at each listed expiry. quotes: (expiry_years, atm_vol)
+// pairs, need not be pre-sorted, duplicate expiries are rejected, not
+// silently collapsed.
+//
+// total variance at expiry T is atm_vol(T)^2 * T (standard convention).
+// xi0 for the bucket between two consecutive expiries is the increase in
+// total variance divided by the bucket width, this is exactly what makes
+// ForwardVarianceCurve arb-free by construction (see its own doc comment
+// in types.rs) PROVIDED the input quotes are themselves calendar-arb-free.
+// if they're not (crossed or stale quotes implying total variance
+// decreases somewhere), that shows up here as a non-positive implied
+// bucket variance.
+//
+// deliberately returns Err instead of clamping or otherwise repairing it.
+// a negative implied variance means the input data is internally
+// inconsistent, and guessing at a "corrected" replacement isn't this
+// function's call to make. that's a different philosophy from
+// local_vol.rs's check_and_repair_surface, which actively fixes what it
+// finds, but that's solving a genuinely different problem: a full 2D
+// surface has more than one plausible repair (which strike gets adjusted,
+// how much), a 1D calendar clash between two ATM quotes doesn't, there's
+// no non-arbitrary number to invent here, only a data problem to report.
+pub fn bootstrap_forward_variance_curve(mut quotes: Vec<(f64, f64)>) -> Result<ForwardVarianceCurve, CurveBootstrapError> {
+    assert!(!quotes.is_empty(), "need at least one quote");
+    quotes.sort_by(|a, b| a.0.partial_cmp(&b.0).expect("expiry must not be NaN"));
+
+    let mut expiries = Vec::with_capacity(quotes.len());
+    let mut variances = Vec::with_capacity(quotes.len());
+    let (mut prev_t, mut prev_total_var) = (0.0, 0.0);
+
+    for (expiry, atm_vol) in quotes {
+        if expiry <= prev_t {
+            return Err(CurveBootstrapError::NonAscendingExpiry { expiry });
+        }
+        let total_var = atm_vol * atm_vol * expiry;
+        let xi0 = (total_var - prev_total_var) / (expiry - prev_t);
+        if xi0 <= 0.0 {
+            return Err(CurveBootstrapError::NonPositiveImpliedVariance { expiry, implied_xi0: xi0 });
+        }
+        expiries.push(expiry);
+        variances.push(xi0);
+        prev_t = expiry;
+        prev_total_var = total_var;
+    }
+
+    Ok(ForwardVarianceCurve::new(expiries, variances))
+}
+
 #[cfg(test)]
 // Y(t_i), i=0..m-1, sampled directly from the TRUE continuous-time process's
 // own covariance structure, Lemma 4.3, same closed form and same hyp2f1 as
@@ -603,5 +664,60 @@ mod tests {
         let actual_ratio   = s1[4] / s2[4]; // (1,1) in a flat 3x3, i*dim+j = 1*3+1
         assert!((actual_ratio - expected_ratio).abs() / expected_ratio < 1e-9,
             "actual={actual_ratio} expected={expected_ratio}");
+    }
+
+    #[test]
+    fn bootstrap_recovers_flat_curve() {
+        let quotes = vec![(0.25, 0.30), (0.5, 0.30), (1.0, 0.30), (2.0, 0.30)];
+        let curve = bootstrap_forward_variance_curve(quotes).unwrap();
+        for &xi0 in &curve.variances {
+            assert!((xi0 - 0.09).abs() < 1e-12, "expected flat xi0=0.09, got {xi0}");
+        }
+    }
+
+    #[test]
+    fn bootstrap_recovers_known_term_structure() {
+        // pick total variance directly (not atm_vol) so the expected xi0
+        // per bucket is exact and easy to hand-check, then convert to the
+        // atm_vol the function actually takes as input.
+        let expiries: [f64; 4] = [0.1, 0.3, 0.6, 1.0];
+        let target_xi0: [f64; 4] = [0.16, 0.09, 0.25, 0.04]; // deliberately non-monotone in xi0 itself, only cumulative total variance has to increase
+        let mut total_var = 0.0;
+        let mut prev_t = 0.0;
+        let mut quotes = Vec::new();
+        for (i, &t) in expiries.iter().enumerate() {
+            total_var += target_xi0[i] * (t - prev_t);
+            quotes.push((t, (total_var / t).sqrt()));
+            prev_t = t;
+        }
+
+        let curve = bootstrap_forward_variance_curve(quotes).unwrap();
+        for (i, &xi0) in curve.variances.iter().enumerate() {
+            assert!((xi0 - target_xi0[i]).abs() < 1e-9, "bucket {i}: got {xi0} expected {}", target_xi0[i]);
+        }
+    }
+
+    #[test]
+    fn bootstrap_detects_calendar_arbitrage() {
+        // total variance at 0.5y with vol=0.10 is 0.005, less than at 0.25y
+        // with vol=0.30 (0.01875), a real crossed-quote scenario, not
+        // contrived math: this is exactly what a stale or fat-fingered
+        // quote looks like.
+        let quotes = vec![(0.25, 0.30), (0.5, 0.10)];
+        let err = bootstrap_forward_variance_curve(quotes).unwrap_err();
+        match err {
+            CurveBootstrapError::NonPositiveImpliedVariance { expiry, implied_xi0 } => {
+                assert!((expiry - 0.5).abs() < 1e-12);
+                assert!(implied_xi0 < 0.0);
+            }
+            other => panic!("expected NonPositiveImpliedVariance, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bootstrap_rejects_duplicate_expiry() {
+        let quotes = vec![(0.5, 0.30), (0.5, 0.32)];
+        let err = bootstrap_forward_variance_curve(quotes).unwrap_err();
+        assert_eq!(err, CurveBootstrapError::NonAscendingExpiry { expiry: 0.5 });
     }
 }
