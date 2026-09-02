@@ -591,6 +591,139 @@ mod tests {
         McConfig { n_paths: 100_000, n_steps: 64, seed: 3, antithetic: true, scheme: VarianceScheme::FullTruncationEuler }
     }
 
+    // sequential (no rayon, this is a correctness benchmark not a hot path),
+    // builds the exact joint covariance once, prices via the same
+    // run_rbergomi_path Euler update the fast pricer uses, so the ONLY
+    // thing under test when comparing against mc_rough_bergomi is the
+    // variance-path construction (hybrid+FFT vs exact), not two different
+    // price-integration schemes.
+    #[allow(clippy::too_many_arguments)]
+    fn mc_rough_bergomi_exact_reference(
+        spot: f64, expiry: f64, rate: f64, div_yield: f64,
+        params: &RoughBergomiParams, curve: &ForwardVarianceCurve,
+        strike: f64, opt_type: OptionType, n_steps: usize, n_paths: usize, seed: u64,
+    ) -> (f64, f64) {
+        let dt = expiry / n_steps as f64;
+        let times: Vec<f64> = (0..n_steps).map(|i| i as f64 * dt).collect();
+        let alpha = params.alpha();
+        let drift0 = rate - div_yield;
+        let payoff = Payoff::European { strike, opt_type };
+
+        let joint_cov = crate::rbergomi::exact_joint_covariance(alpha, &times, dt);
+        let joint_dim = 2 * n_steps - 1;
+        let l_joint = crate::rbergomi::cholesky_lower(&joint_cov, joint_dim)
+            .expect("exact joint covariance should be positive definite");
+
+        let mut rng = SmallRng::seed_from_u64(seed);
+        let (mut sum, mut sum_sq) = (0.0, 0.0);
+
+        for _ in 0..n_paths {
+            let mut z = vec![0.0; joint_dim];
+            for i in (0..joint_dim).step_by(2) {
+                let (a, b) = box_muller(&mut rng);
+                z[i] = a;
+                if i + 1 < joint_dim { z[i + 1] = b; }
+            }
+            let mut zperp = vec![0.0; n_steps];
+            for i in (0..n_steps).step_by(2) {
+                let (a, b) = box_muller(&mut rng);
+                zperp[i] = a;
+                if i + 1 < n_steps { zperp[i + 1] = b; }
+            }
+
+            let (v, dz) = crate::rbergomi::simulate_price_exact(params, curve, &times, dt, &l_joint, &z, &zperp);
+            let payoff_val = run_rbergomi_path(spot, drift0, &v, &dz, dt, &payoff, rate, expiry);
+            sum += payoff_val;
+            sum_sq += payoff_val * payoff_val;
+        }
+
+        let n_f = n_paths as f64;
+        let mean = sum / n_f;
+        let var = (sum_sq / n_f - mean * mean).max(0.0);
+        (mean, (var / n_f).sqrt())
+    }
+
+    // benchmark against the TRUE continuous-time process's own covariance
+    // (Lemma 4.3, same closed form as commit 1, no discretization at all
+    // beyond the Cholesky factorization's own float error), not against
+    // another instance of the same discretized scheme, that would be
+    // circular. same spirit as the paper's own Figure 4, done here via
+    // prices at a few strikes rather than inverted IVs, price agreement at
+    // multiple strikes carries the same information as smile agreement
+    // without pulling iv.rs into this specific check.
+    #[test]
+    fn rbergomi_fast_scheme_matches_exact_covariance_reference() {
+        let params = RoughBergomiParams { eta: 1.9, rho: -0.9, hurst: 0.07 };
+        let curve = ForwardVarianceCurve::new(vec![1.0], vec![0.09]);
+        let (spot, expiry, rate, div_yield) = (100.0, 0.25, 0.02, 0.0);
+        let n_steps = 40;
+        let n_paths = 200_000;
+
+        let fast_cfg = McConfig { n_paths, n_steps, seed: 7, antithetic: true, scheme: VarianceScheme::FullTruncationEuler };
+
+        for strike in [90.0, 100.0, 110.0] {
+            let fast = mc_rough_bergomi(spot, expiry, rate, div_yield, &params, &curve,
+                Payoff::European { strike, opt_type: OptionType::Call }, &fast_cfg);
+            let (exact_price, exact_se) = mc_rough_bergomi_exact_reference(
+                spot, expiry, rate, div_yield, &params, &curve,
+                strike, OptionType::Call, n_steps, n_paths, 9);
+
+            let combined_se = (fast.std_error.powi(2) + exact_se.powi(2)).sqrt();
+            let z = (fast.price - exact_price).abs() / combined_se;
+            assert!(z < 4.0, "strike={strike} fast={:.4} exact={exact_price:.4} combined_se={combined_se:.4} z={z:.2}",
+                fast.price);
+        }
+    }
+
+    // rough vol's whole reason to exist: ATM skew explodes as T->0 like
+    // T^(H-1/2), unlike classical stochastic vol (Heston/Bates) where it
+    // flattens out. checks the skew is bigger at the shorter maturity by
+    // roughly the predicted ratio, not a tight regression fit, a finite-h
+    // secant at finite T against a T->0 asymptotic result has real slack in
+    // it on its own, a generous multiplicative band is the honest way to
+    // state what this actually checks: the right sign, the right order of
+    // magnitude, not three decimal places of an exponent.
+    #[test]
+    fn rbergomi_short_maturity_skew_explodes_like_the_theory_predicts() {
+        let params = RoughBergomiParams { eta: 1.9, rho: -0.9, hurst: 0.07 };
+        let alpha = params.alpha();
+        let curve = ForwardVarianceCurve::new(vec![1.0], vec![0.09]);
+        let (spot, rate, div_yield) = (100.0, 0.0, 0.0);
+        let h = 0.03_f64; // log-moneyness half-width for the finite-difference skew
+
+        let skew_at = |expiry: f64| -> f64 {
+            let cfg = McConfig { n_paths: 300_000, n_steps: 32, seed: 13, antithetic: true, scheme: VarianceScheme::FullTruncationEuler };
+            let k_lo = spot * (-h).exp();
+            let k_hi = spot * h.exp();
+
+            let price_lo = mc_rough_bergomi(spot, expiry, rate, div_yield, &params, &curve,
+                Payoff::European { strike: k_lo, opt_type: OptionType::Call }, &cfg).price;
+            let price_hi = mc_rough_bergomi(spot, expiry, rate, div_yield, &params, &curve,
+                Payoff::European { strike: k_hi, opt_type: OptionType::Call }, &cfg).price;
+
+            let iv_lo = crate::iv::implied_vol(&crate::types::IvProblem {
+                contract: crate::types::OptionContract { spot, strike: k_lo, expiry, rate, div_yield, vol: 0.3, opt_type: OptionType::Call },
+                market_price: price_lo,
+            }).expect("price_lo should invert");
+            let iv_hi = crate::iv::implied_vol(&crate::types::IvProblem {
+                contract: crate::types::OptionContract { spot, strike: k_hi, expiry, rate, div_yield, vol: 0.3, opt_type: OptionType::Call },
+                market_price: price_hi,
+            }).expect("price_hi should invert");
+
+            (iv_hi - iv_lo) / (2.0 * h)
+        };
+
+        let (t1, t2) = (0.02, 0.16); // 8x apart
+        let skew1 = skew_at(t1).abs();
+        let skew2 = skew_at(t2).abs();
+
+        let predicted_ratio = (t1 / t2).powf(alpha); // alpha = H - 1/2 < 0, shorter T => bigger skew
+        let actual_ratio = skew1 / skew2;
+
+        assert!(actual_ratio > 1.3 && actual_ratio < predicted_ratio * 1.8,
+            "skew({t1})={skew1:.4} skew({t2})={skew2:.4} actual_ratio={actual_ratio:.2} predicted_ratio={predicted_ratio:.2}");
+    }
+
     // (S_T - 0)^+ = S_T always (S_T > 0), so a strike=0 call's discounted
     // price is exactly E[disc * S_T], which has to equal S(0) by
     // construction of the stochastic exponential (the -1/2 v ds compensator
