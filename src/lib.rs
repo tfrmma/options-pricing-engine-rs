@@ -14,12 +14,14 @@ pub mod mc;
 pub mod batch;
 pub mod calibration;
 pub mod rbergomi;
+pub mod deribit_inverse;
 
 // flatten the hot path to crate root
 pub use types::{OptionType, OptionContract, PricingResult, IvProblem,
                 HestonParams, BatesParams, LocalVolSurface,
                 RoughBergomiParams, ForwardVarianceCurve};
 pub use rbergomi::{bootstrap_forward_variance_curve, CurveBootstrapError};
+pub use deribit_inverse::InverseGreeks;
 pub use bsm::{bsm_price, bsm_price_and_greeks, black76_price_and_greeks};
 pub use iv::implied_vol;
 pub use heston::{heston_price, heston_price_and_greeks};
