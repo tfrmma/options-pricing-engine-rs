@@ -10,6 +10,7 @@ License: MIT. See [LICENSE](LICENSE).
 
 - [Models](#models)
 - [Rough Bergomi (work in progress)](#rough-bergomi-work-in-progress)
+- [Deribit inverse (coin-settled) options](#deribit-inverse-coin-settled-options)
 - [Design](#design)
 - [Build](#build)
 - [Usage](#usage)
@@ -30,8 +31,9 @@ License: MIT. See [LICENSE](LICENSE).
 | Local Vol (Dupire 1994) | Fritsch-Butland monotone cubic spline, differentiated through the spline, not the raw grid | Numerical (local vol surface) |
 | Monte Carlo (Heston/Bates) | Full truncation Euler (default) or Andersen (2008) QE, exact per-step Poisson jump counts, antithetic variates | N/A, path-dependent payoffs only (European, Asian, up-and-out barrier) |
 | Rough Bergomi (Bayer, Friz, Gatheral 2016) | Monte Carlo via the hybrid scheme (Bennedsen, Lunde, Pakkanen 2017), κ=2, FFT tail convolution | N/A. Only `Payoff::European` is validated so far, see [Rough Bergomi](#rough-bergomi-work-in-progress) |
+| Deribit inverse (coin-settled) | Closed form, Deribit's own forward-based BS formula | Full analytic: Δ, Γ, ν, Θ, vanna, volga, all in coin terms, see [Deribit inverse options](#deribit-inverse-coin-settled-options) |
 
-All five analytic models share the same `OptionContract`/`PricingResult` conventions where applicable, so switching models in a caller doesn't mean rewriting the call site.
+All five analytic USD-settled models share the same `OptionContract`/`PricingResult` conventions where applicable, so switching models in a caller doesn't mean rewriting the call site. Deribit inverse options are priced/hedged against the forward directly and return coin-denominated Greeks in a separate `InverseGreeks` struct, deliberately not `PricingResult`, mixing USD and coin units in one type would be a silent unit bug waiting to happen.
 
 ## Rough Bergomi (work in progress)
 
@@ -48,9 +50,23 @@ Building the exact reference caught two real bugs, neither found by inspection:
 1. **Predictable-variance violation.** The first version evaluated Y(t_i) at the *end* of each pricing interval. Mathematically valid on its own (Y(t) = ∫₀ᵗ(t-s)^α dW(s) is a perfectly good random variable at any t), but wrong for what it was being used for: v(t_i) is supposed to be known *before* the shock over [t_i, t_i+dt) it scales, and Y(t_i) evaluated at the interval's end necessarily already includes that interval's own Brownian shock. The fast scheme gets this right by construction, its near/far recursion only ever reaches back into strictly earlier steps. The exact reference didn't, until a diagnostic comparing terminal log-price moments showed the mean off by 10x more than Jensen's inequality could explain and realized variance running ~3x too high. Fixed by evaluating Y at the *start* of each interval instead, matching the fast scheme's own convention, which also meant explicitly excluding the deterministic Y(0)=0 point from the covariance matrix (a zero-variance row correctly fails strict positive-definiteness, that was the very next thing that broke once the first bug was fixed).
 2. **A silent NaN pivot in `cholesky_lower`.** `sum <= 0.0` is `false` when `sum` is `NaN` (IEEE 754 comparisons involving NaN are always false), so a NaN pivot was passing the "positive definite" check and returning `Some(garbage)` instead of the documented `None`. The NaN itself came from a boundary case in the new covariance formula: a term that's mathematically exactly zero at one specific index (`ti - end_j` when the increment ends exactly at the evaluation point) landed a floating-point hair on the negative side due to two different computation paths for what should be the same number, and `powf` of a negative base with a fractional exponent is NaN, not a small negative number. Two independent fixes: clamp that one term to `max(0.0)` before `powf`, and make `cholesky_lower` check `sum.is_nan() || sum <= 0.0`, the second one because a numerics function whose whole contract is "`None` if not positive definite" silently returning corrupted data on a NaN pivot is a real gap regardless of what triggered it here, and it's been sitting in the production hybrid-scheme path since commit 1.
 
-Still missing: the deep-calibration surrogate (offline-trained tiny MLP, hand-rolled Rust inference, no ONNX runtime for a ~5.6k-parameter network) and `AsianArithmetic`/`UpAndOut` validation against a rough-vol path specifically.
+**Deep-calibration surrogate, dataset generation.** `gen_rbergomi_dataset` (`src/bin/`) is the first piece: samples (ξ0, η, ρ, H) uniformly over a crypto-relevant box (vol 10%-50%, η∈[0.5,4], ρ∈[-0.95,-0.05], H∈[0.02,0.45]), prices a fixed grid via `mc_rough_bergomi`, inverts to IV, writes a self-describing CSV (column names encode the grid points, no separate metadata file to keep in sync). Flat ξ0 for now, not the full `ForwardVarianceCurve` term structure: the curve is bootstrapped from market quotes, not calibrated, so the surrogate only needs (η, ρ, H) → IV-grid given a curve level, not the curve shape. A surrogate that has to generalize across genuinely different curve shapes would need the curve as extra input dimensions, that's follow-on work, not assumed away.
+
+The maturity grid is crypto-short-dated (3d/7d/14d/30d/90d) on purpose. The strike grid is standard-deviation multiples (z-scores times `sqrt(ξ0·T)`), not a fixed percentage log-moneyness, the first version used a flat ±40% moneyness at every maturity and 30.9% of grid points failed to invert, all of it concentrated at short T with wide moneyness: a 3-day option with ~20% vol has an expected move of about 2%, a strike 40% away prices at noise level, not a real number worth training on. Scaling by the expected move brought that down to 0.29% on the same 20-sample verification run. Only run at verification scale so far (20 samples, ~50 seconds), not training scale (the literature uses tens of thousands), that's a deliberately different thing to run once and leave going, not something to do inside this session.
+
+Still missing: the actual training step (offline, Python/PyTorch, not this repo), the hand-rolled Rust inference layer with golden-value tests against the trained weights, and `AsianArithmetic`/`UpAndOut` validation against a rough-vol path specifically.
 
 All formulas checked against arXiv:1507.03004v4 directly, not from memory and not from a secondary writeup, see [References](#references). One thing worth calling out from commit 1 still stands: `hyp2f1_matches_numeric_quadrature` initially passed with a plain equally-spaced Simpson quadrature that silently carried ~0.7% error from the integrable singularity at the interval endpoint, caught by cross-checking against an independent arbitrary-precision implementation (mpmath), not by inspection, fixed with a substitution, now agrees to 3e-7. And from commit 2: `variance_of_simulated_y_matches_exact_scheme_variance` doesn't test against the paper's asymptotic MSE result (Theorem 2.5/Corollary 2.7), that convergence is genuinely slow for α near -0.5 (rate ~n^{-(α+1/2)+ε}, which at α=-0.43 is close to n^{-0.07}) and would need an impractically large `n_steps` to pin down tightly in a fast test. Instead it checks Var(Yn(t)) against a closed form derived from the discretization scheme's *own* definition (near and far terms touch disjoint step indices with nonzero weight, so they're independent, no cross-covariance term needed), which is exact at any `n_steps` and isolates implementation bugs from the scheme's own, already-proven-in-the-paper approximation error.
+
+## Deribit inverse (coin-settled) options
+
+`deribit_inverse.rs`. Deribit's BTC/ETH options are the primary product on that venue and they're coin-margined, coin-settled: premium, margin, and payoff are all denominated in the underlying coin, not USD. That's not "the same option divided by spot." A linear call's payoff is `(S_T-K)^+` in USD; an inverse call pays `(S_T-K)^+/S_T` in coin, and the division by the terminal price is a genuine convexity source (a quanto-like effect), not a scaling factor you can bolt onto an existing linear pricer after the fact. Greeks change accordingly: an inverse option's delta is a hedge ratio against the tradable future/perp in coin terms, order-of-magnitude `~0.5/F` at the money instead of `~0.5`, and gamma/vanna/volga all pick up extra `1/F` powers from the same chain rule.
+
+Ported from [`options-market-making-engine-rs`](https://github.com/tfrmma/options-market-making-engine-rs) (`book-risk::inverse_option`), not re-derived here: same formulas, same test cross-checks (put-call parity, finite-difference Greeks, vanna two independent ways), adapted to this crate's `OptionType`/`ncdf`/`npdf` and to the `phi = opt_type.sign()` call/put unification `bsm.rs` already uses instead of a `match` arm per Greek. Re-verified after porting (14/14 tests passing against the *re-derived* unified formulas), not assumed identical just because the source was already trusted, the phi-unified gamma in particular is a different algebraic path than the source's explicit call/put match arms and could plausibly have diverged from it under porting.
+
+Deribit publishes their own closed-form BS-based formula for this (linked in the module's doc comment); this implements exactly that, the "naive" inverse parametrization in the language of Alexander & Imeraj (2021), who also derive a quanto-corrected version with an extra convexity term this does *not* include. That's deliberate: matching the venue's actual mark price is the point, not the more theoretically complete academic version. Worth knowing if this ever needs to reconcile against a different venue or a risk system that uses the quanto-corrected convention instead.
+
+Forward-based, not spot-based: `price_coin`/`greeks` take the future/perp mark price directly as `forward`, the same way a trader actually quotes and hedges these, not `spot` + carry. No MC path, no term structure, this is a closed-form single-vol-input pricer, it doesn't (yet) plug into `RoughBergomiParams`/`ForwardVarianceCurve` or the calibration/AD machinery, whether that's worth doing depends on whether the smile actually needs to differ from the direct-quoted USD smile for the same underlying, which it generally shouldn't by much, IV is IV regardless of settlement currency, only the payoff/Greeks conversion changes.
 
 ## Design
 
@@ -95,6 +111,9 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release
 
 # smoke test + timing harness
 cargo run --release
+
+# rough Bergomi synthetic dataset for the future calibration surrogate
+cargo run --release --bin gen_rbergomi_dataset -- [n_samples] [output_path] [seed]
 
 # full test suite
 cargo test --release
@@ -197,7 +216,7 @@ let bgreeks = batch_bates_greeks(&chain, &bp0);
 
 ## Testing
 
-99 tests, `cargo test --release`, all synchronous and deterministic (no timing-dependent assertions, the Monte Carlo tests use a fixed seed and check convergence against the analytic price within a multiple of the MC's own reported standard error, not a fixed tolerance). A further 6 profiling benchmarks are marked `#[ignore]` since they measure timing, not correctness, run them with `cargo test --release -- --ignored --nocapture --test-threads=1 ad::tests::profile`.
+113 tests, `cargo test --release`, all synchronous and deterministic (no timing-dependent assertions, the Monte Carlo tests use a fixed seed and check convergence against the analytic price within a multiple of the MC's own reported standard error, not a fixed tolerance). A further 6 profiling benchmarks are marked `#[ignore]` since they measure timing, not correctness, run them with `cargo test --release -- --ignored --nocapture --test-threads=1 ad::tests::profile`.
 
 | Module | Tests | Covers |
 |---|---:|---|
@@ -212,6 +231,7 @@ let bgreeks = batch_bates_greeks(&chain, &bp0);
 | `bsm` | 4 | Put-call parity, sign checks, Black-76 sanity vs BSM, Black-76 rho vs finite difference |
 | `iv` | 4 | Round-trip recovery at ATM, OTM, and low vol, rejects a price outside no-arbitrage bounds |
 | `math` | 3 | `ncdf` sanity and tail precision, `ncdf_inv` round-trip |
+| `deribit_inverse` | 14 | Put-call parity in coin terms, delta/gamma/vega/theta match finite differences, vanna matches FD two independent ways (via delta and via vega), volga matches FD, call/put equality for vega/theta/vanna/volga (all four are parity-invariant, C-P=1-K/F doesn't depend on vol or T), ATM coin delta is order `1/F` not order 1, intrinsic value at expiry is `(F-K)/F` not `F-K`, vanna/volga are exactly zero past expiry |
 
 Two of these are worth calling out specifically: `fast_csqrt_matches_builtin` exists because the first version of `fast_csqrt` passed a 37-angle, evenly-spread correctness sweep and then broke `zero_vol_of_vol_matches_bsm` in the full suite, a coarse angular sweep doesn't sample close enough to the axes to catch catastrophic cancellation that only bites within a fraction of a degree of them. Both `fast_csqrt` and the dual `csqrt` in `ad.rs` had this bug, independently, from the same textbook formula. Neither test is decorative.
 
@@ -273,3 +293,5 @@ No `ndarray`, no `nalgebra`, no linear algebra crate, the calibration Jacobian i
 - Knuth, D. E. (1969). *The Art of Computer Programming, Volume 2: Seminumerical Algorithms.* (exact Poisson sampling used for per-step jump counts)
 - Bennedsen, M., Lunde, A., Pakkanen, M. S. (2017). *Hybrid scheme for Brownian semistationary processes.* Finance and Stochastics 21(4). (the hybrid scheme kernel implemented in `rbergomi.rs`)
 - Bayer, C., Friz, P., Gatheral, J. (2016). *Pricing under rough volatility.* Quantitative Finance 16(6). (the rough Bergomi model itself, target of the hybrid scheme's option-pricing experiment)
+- Deribit. *Inverse Options.* https://support.deribit.com/hc/en-us/articles/31424939096093-Inverse-Options (the venue's own coin-settled pricing formula, implemented as-is in `deribit_inverse.rs`)
+- Alexander, C., Imeraj, A. (2021). *Inverse and Quanto Inverse Options in a Black-Scholes World.* (names the "naive" vs quanto-corrected inverse parametrizations, this module implements the naive one, matching Deribit's own convention)
