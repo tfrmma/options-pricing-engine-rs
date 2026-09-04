@@ -36,6 +36,7 @@
 // USD-style delta would be off by a factor of F from that.
 
 use crate::math::{ncdf, npdf};
+use crate::mc::McResult;
 use crate::types::OptionType;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -108,6 +109,47 @@ pub fn greeks(opt_type: OptionType, forward: f64, strike: f64, vol: f64, t: f64)
     let volga = vega * d1 * d2 / vol;
 
     InverseGreeks { price_coin: price_coin_now, delta, gamma, vega, theta, vanna, volga }
+}
+
+// converts an existing USD-settled MC price (mc.rs, any of Heston/Bates/
+// rBergomi, any of European/AsianArithmetic/UpAndOut) into the
+// coin-settled equivalent. NOT price/spot_T (dividing by the terminal
+// price, path by path), that was the first version of this and it's
+// wrong: it silently priced under the wrong probability measure and
+// missed the Deribit closed-form cross-check by a z-score in the 40s-60s,
+// caught by that cross-check, not by inspection.
+//
+// derivation: a coin-settled payoff is h(path)/S_T for some USD payoff
+// h(path) (h = (S_T-K)^+ for a European call, the running average minus
+// strike for an Asian, etc). the correct price is the expectation under
+// the SHARE numeraire measure Q^S (numeraire = the asset itself, not the
+// money-market account), not the standard risk-neutral measure Q, that's
+// what "coin-settled" actually means, the premium and the payoff are
+// denominated in a numeraire that moves with the asset. the Radon-Nikodym
+// derivative for switching from the money-market numeraire to the share
+// numeraire is dQ^S/dQ = S_T*e^{-(r-q)T}/S_0 (a completely general
+// change-of-numeraire result, only requires S_t*e^{-(r-q)t} to be a
+// Q-martingale, true by construction for every model in mc.rs, not
+// specific to flat vol or to European payoffs):
+//
+//   E^{Q^S}[h(path)/S_T] = E^Q[h(path)/S_T * S_T*e^{-(r-q)T}/S_0]
+//                        = (e^{-(r-q)T}/S_0) * E^Q[h(path)]      <- S_T cancels
+//
+// so the coin price is just (e^{q*T}/S_0) times the ALREADY-DISCOUNTED
+// standard USD MC price, no new simulation, no new payoff logic, no
+// change of drift needed. verified against deribit_inverse::price_coin
+// directly (q=0 case: BSM call / S_0 matched the closed form to 6 decimal
+// places, see the crate root test), and the S_T-cancellation step above
+// never used flat vol, so the same rescale is correct for Heston/Bates/
+// rBergomi and for path-dependent payoffs (Asian, barrier) too, not just
+// vanilla European.
+//
+// std_error scales by the same constant: it's a linear rescale of the
+// whole per-path estimator, correlation structure across paths is
+// unaffected.
+pub fn mc_result_to_coin(usd_result: McResult, spot: f64, div_yield: f64, expiry: f64) -> McResult {
+    let scale = (div_yield * expiry).exp() / spot;
+    McResult { price: usd_result.price * scale, std_error: usd_result.std_error * scale }
 }
 
 #[cfg(test)]
@@ -305,5 +347,59 @@ mod tests {
         assert!((itm_call - (forward - 60000.0) / forward).abs() < 1e-12);
         let otm_call = price_coin(OptionType::Call, forward, 70000.0, 0.6, 0.0);
         assert_eq!(otm_call, 0.0);
+    }
+
+    // mc_result_to_coin against rBergomi with near-zero vol-of-vol, which
+    // collapses to flat BSM (same trick as mc.rs's own
+    // rbergomi_matches_black_scholes_when_vol_of_vol_is_tiny). two
+    // independently-built pricers, closed-form here, hybrid-scheme MC
+    // there, agreeing is a real cross-check on the rescale, not a
+    // self-consistency check on either one alone. this is the test that
+    // caught the first (wrong) implementation, z was in the 40s-60s, not a
+    // rounding-error mismatch.
+    #[test]
+    fn rbergomi_rescale_matches_closed_form_when_vol_of_vol_is_tiny() {
+        use crate::mc::{mc_rough_bergomi, McConfig, Payoff, VarianceScheme};
+        use crate::types::{RoughBergomiParams, ForwardVarianceCurve};
+
+        let params = RoughBergomiParams { eta: 0.001, rho: -0.9, hurst: 0.07 };
+        let xi0 = 0.04;
+        let curve = ForwardVarianceCurve::new(vec![2.0], vec![xi0]);
+        let (s, k, t, r, q): (f64, f64, f64, f64, f64) = (100.0, 100.0, 1.0, 0.05, 0.0);
+        let forward = s * ((r - q) * t).exp();
+
+        let closed = price_coin(OptionType::Call, forward, k, xi0.sqrt(), t);
+
+        let cfg = McConfig { n_paths: 100_000, n_steps: 64, seed: 3, antithetic: true, scheme: VarianceScheme::FullTruncationEuler };
+        let usd = mc_rough_bergomi(s, t, r, q, &params, &curve,
+            Payoff::European { strike: k, opt_type: OptionType::Call }, &cfg);
+        let coin = mc_result_to_coin(usd, s, q, t);
+
+        let z = (coin.price - closed).abs() / coin.std_error;
+        assert!(z < 4.0, "closed={closed:.6} coin={:.6} se={:.6} z={z:.2}", coin.price, coin.std_error);
+    }
+
+    // same cross-check, Heston MC instead of rBergomi (near-zero vol-of-vol
+    // sigma this time), confirms the rescale is correct for a genuinely
+    // different stochastic-vol model, not just one whose implementation
+    // happens to agree.
+    #[test]
+    fn heston_rescale_matches_closed_form_when_vol_of_vol_is_tiny() {
+        use crate::mc::{mc_heston, McConfig, Payoff, VarianceScheme};
+        use crate::types::HestonParams;
+
+        let heston_params = HestonParams { v0: 0.04, kappa: 2.0, theta: 0.04, sigma: 0.001, rho: -0.5 };
+        let (s, k, t, r, q): (f64, f64, f64, f64, f64) = (100.0, 100.0, 1.0, 0.05, 0.0);
+        let forward = s * ((r - q) * t).exp();
+
+        let closed = price_coin(OptionType::Call, forward, k, 0.04_f64.sqrt(), t);
+
+        let cfg = McConfig { n_paths: 100_000, n_steps: 100, seed: 7, antithetic: true, scheme: VarianceScheme::FullTruncationEuler };
+        let usd = mc_heston(s, t, r, q, &heston_params,
+            Payoff::European { strike: k, opt_type: OptionType::Call }, &cfg);
+        let coin = mc_result_to_coin(usd, s, q, t);
+
+        let z = (coin.price - closed).abs() / coin.std_error;
+        assert!(z < 4.0, "closed={closed:.6} coin={:.6} se={:.6} z={z:.2}", coin.price, coin.std_error);
     }
 }
