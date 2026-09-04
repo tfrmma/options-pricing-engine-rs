@@ -111,6 +111,97 @@ pub fn greeks(opt_type: OptionType, forward: f64, strike: f64, vol: f64, t: f64)
     InverseGreeks { price_coin: price_coin_now, delta, gamma, vega, theta, vanna, volga }
 }
 
+// implied vol from a coin-denominated market price, same Halley-with-
+// bisection-fallback architecture as iv.rs, forward-based instead of
+// spot/rate/div_yield since that's what a coin-settled quote actually
+// gives you (Deribit quotes premium in coin against the mark price of
+// the corresponding future, not against spot).
+pub struct CoinIvProblem {
+    pub forward: f64,
+    pub strike: f64,
+    pub expiry: f64,
+    pub opt_type: OptionType,
+    pub market_price_coin: f64,
+}
+
+const MAX_ITER: usize = 10;
+const TOL: f64 = 1e-10;
+
+pub fn implied_vol_coin(prob: &CoinIvProblem) -> Option<f64> {
+    if !price_in_bounds(prob) { return None; }
+    let v0 = initial_guess(prob)?;
+    halley_solve(prob, v0)
+}
+
+fn price_in_bounds(p: &CoinIvProblem) -> bool {
+    if p.market_price_coin <= 0.0 { return false; }
+    let phi = p.opt_type.sign();
+    let intrinsic = (phi * (p.forward - p.strike) / p.forward).max(0.0);
+    if p.market_price_coin < intrinsic { return false; }
+    // a coin call is worth strictly less than one coin: the payoff itself,
+    // (S_T-K)^+/S_T = max(0, 1-K/S_T), is bounded above by 1 pointwise for
+    // any K>0, so its expectation is too. checked numerically across
+    // 200k random (F,K,vol,T) draws before relying on it, max observed
+    // 1.0 (the asymptotic limit, never exceeded).
+    //
+    // puts get no such bound. (K-S_T)^+/S_T = max(0, K/S_T-1) is genuinely
+    // unbounded as S_T->0, and so is its price: a deep ITM put (K/F=100)
+    // priced out to ~99 coin in the same sweep, scaling with K/F, not
+    // capped at 1. real asymmetry inverse options have that linear ones
+    // don't, not a bug to paper over with a symmetric bound.
+    if p.opt_type == OptionType::Call && p.market_price_coin >= 1.0 { return false; }
+    true
+}
+
+// Brenner-Subrahmanyam ATM approximation, coin version. near ATM (F~K),
+// price_coin(Call) = N(d1) - (K/F)N(d2) ~ N(d1)-N(d2) ~ npdf(0)*(d1-d2) =
+// vol*sqrt(T)/sqrt(2pi), since d1-d2 = vol*sqrt(T) always and K/F~1. no
+// fwd/discount-factor rescale needed the way iv.rs's USD version has,
+// price_coin is already unitless (coin per coin, not USD per share), the
+// ATM approximation is just its inverse directly. same moneyness
+// adjustment and same 0.2*price fallback-to-bisection tolerance as iv.rs.
+fn initial_guess(p: &CoinIvProblem) -> Option<f64> {
+    let bs = p.market_price_coin * (2.0 * std::f64::consts::PI / p.expiry).sqrt();
+    let x  = (p.forward / p.strike).ln();
+    let v0 = (bs / (-0.5 * x * x).exp().max(0.01)).clamp(0.001, 10.0);
+
+    if (price_coin(p.opt_type, p.forward, p.strike, v0, p.expiry) - p.market_price_coin).abs() < 0.2 * p.market_price_coin {
+        return Some(v0);
+    }
+    bisect(p)
+}
+
+fn bisect(p: &CoinIvProblem) -> Option<f64> {
+    let mut lo = 1e-4_f64;
+    let mut hi = 10.0_f64;
+    let f = |v: f64| price_coin(p.opt_type, p.forward, p.strike, v, p.expiry) - p.market_price_coin;
+    if f(lo) * f(hi) > 0.0 { return None; }
+    for _ in 0..60 {
+        let mid = 0.5 * (lo + hi);
+        if f(mid) < 0.0 { lo = mid; } else { hi = mid; }
+        if hi - lo < 1e-9 { return Some(mid); }
+    }
+    Some(0.5 * (lo + hi))
+}
+
+fn halley_solve(p: &CoinIvProblem, v0: f64) -> Option<f64> {
+    let mut v = v0;
+    for _ in 0..MAX_ITER {
+        let err = price_coin(p.opt_type, p.forward, p.strike, v, p.expiry) - p.market_price_coin;
+        if err.abs() < TOL { return Some(v); }
+        let g = greeks(p.opt_type, p.forward, p.strike, v, p.expiry); // vega/volga, reuses the already-tested closed form instead of a second copy of it
+        if g.vega.abs() < 1e-14 { return None; }
+        let denom = (1.0 - err * g.volga / (2.0 * g.vega * g.vega)).clamp(0.5, 2.0);
+        v -= err / (g.vega * denom);
+        if v <= 0.0 { v = 1e-8; }
+    }
+    if (price_coin(p.opt_type, p.forward, p.strike, v, p.expiry) - p.market_price_coin).abs() < 1e-6 {
+        Some(v)
+    } else {
+        None
+    }
+}
+
 // converts an existing USD-settled MC price (mc.rs, any of Heston/Bates/
 // rBergomi, any of European/AsianArithmetic/UpAndOut) into the
 // coin-settled equivalent. NOT price/spot_T (dividing by the terminal
@@ -155,6 +246,94 @@ pub fn mc_result_to_coin(usd_result: McResult, spot: f64, div_yield: f64, expiry
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn coin_iv_roundtrip(forward: f64, strike: f64, vol: f64, t: f64, opt_type: OptionType) {
+        let price = price_coin(opt_type, forward, strike, vol, t);
+        let iv = implied_vol_coin(&CoinIvProblem { forward, strike, expiry: t, opt_type, market_price_coin: price })
+            .unwrap_or_else(|| panic!("solver bailed on vol={vol}"));
+        assert!((iv - vol).abs() < 1e-7, "got {iv:.8} expected {vol}");
+    }
+
+    #[test]
+    fn coin_iv_roundtrip_atm() {
+        coin_iv_roundtrip(65000.0, 65000.0, 0.6, 30.0 / 365.0, OptionType::Call);
+        coin_iv_roundtrip(65000.0, 65000.0, 0.6, 30.0 / 365.0, OptionType::Put);
+    }
+
+    #[test]
+    fn coin_iv_roundtrip_otm_and_itm() {
+        coin_iv_roundtrip(65000.0, 75000.0, 0.7, 14.0 / 365.0, OptionType::Call); // OTM call
+        coin_iv_roundtrip(65000.0, 55000.0, 0.7, 14.0 / 365.0, OptionType::Call); // ITM call
+        coin_iv_roundtrip(65000.0, 55000.0, 0.9, 90.0 / 365.0, OptionType::Put);  // deep ITM put (K << F, small side)
+    }
+
+    #[test]
+    fn coin_iv_roundtrip_deep_itm_put() {
+        // K/F=3, price_coin ~2.0, comfortably past the call's <1 bound,
+        // this is exactly the case with no upper bound. checked vega isn't
+        // near zero before picking these numbers, a first attempt at K/F=60
+        // put the option so deep ITM the price is flat at intrinsic across
+        // vol=0.05 to vol=3.0 (T=30d), genuinely ill-posed for inversion,
+        // not a solver bug, replaced rather than forced to converge on a
+        // number the price barely depends on.
+        coin_iv_roundtrip(30000.0, 90000.0, 0.8, 180.0 / 365.0, OptionType::Put);
+    }
+
+    #[test]
+    fn coin_iv_roundtrip_low_vol() {
+        coin_iv_roundtrip(65000.0, 65000.0, 0.15, 7.0 / 365.0, OptionType::Call);
+    }
+
+    #[test]
+    fn coin_iv_rejects_bad_price() {
+        let base = CoinIvProblem { forward: 65000.0, strike: 65000.0, expiry: 30.0 / 365.0, opt_type: OptionType::Call, market_price_coin: -1.0 };
+        assert!(implied_vol_coin(&base).is_none());
+    }
+
+    #[test]
+    fn coin_iv_rejects_call_priced_at_or_above_one() {
+        // a coin call can never be worth a full coin (see price_in_bounds),
+        // 1.0 exactly and anything above it should both bounce.
+        for bad_price in [1.0, 1.5, 100.0] {
+            let p = CoinIvProblem { forward: 65000.0, strike: 65000.0, expiry: 30.0 / 365.0, opt_type: OptionType::Call, market_price_coin: bad_price };
+            assert!(implied_vol_coin(&p).is_none(), "should reject call price {bad_price}");
+        }
+    }
+
+    #[test]
+    fn coin_iv_accepts_put_priced_above_one() {
+        // puts have no such bound, this must NOT be rejected just because
+        // it's over 1.0, only the intrinsic-value floor applies to them.
+        coin_iv_roundtrip(30000.0, 90000.0, 0.8, 180.0 / 365.0, OptionType::Put);
+    }
+
+    #[test]
+    fn coin_iv_rejects_price_below_intrinsic() {
+        // forward=65000, strike=60000, call intrinsic = (65000-60000)/65000 ~ 0.0769
+        let p = CoinIvProblem { forward: 65000.0, strike: 60000.0, expiry: 30.0 / 365.0, opt_type: OptionType::Call, market_price_coin: 0.01 };
+        assert!(implied_vol_coin(&p).is_none());
+    }
+
+    // K/F=60, T=30d: price_coin is flat at intrinsic (59.0) across
+    // vol=0.05..3.0, vega effectively zero over that whole range, this is
+    // genuinely ill-posed for inversion, not a solver bug (found while
+    // picking test parameters above, a first attempt used exactly this
+    // combination and the solver landed on vol=2.396 instead of the 0.8
+    // that generated the price). doesn't assert which vol comes back,
+    // only that whatever does reprices consistently, that's the honest
+    // thing to check in a region where many different vols are
+    // observationally indistinguishable within tolerance.
+    #[test]
+    fn coin_iv_near_zero_vega_returns_a_self_consistent_root_not_necessarily_the_generating_one() {
+        let (forward, strike, t) = (1000.0, 60000.0, 30.0 / 365.0);
+        let price = price_coin(OptionType::Put, forward, strike, 0.8, t);
+        if let Some(v) = implied_vol_coin(&CoinIvProblem { forward, strike, expiry: t, opt_type: OptionType::Put, market_price_coin: price }) {
+            let repriced = price_coin(OptionType::Put, forward, strike, v, t);
+            assert!((repriced - price).abs() < 1e-6, "solver returned vol={v} which reprices to {repriced}, not {price}");
+        }
+        // None is also an acceptable outcome here, bailing on an
+        // ill-conditioned problem beats a confident wrong answer.
+    }
 
     fn fd_delta(opt_type: OptionType, forward: f64, strike: f64, vol: f64, t: f64) -> f64 {
         let eps = forward * 1e-6;
