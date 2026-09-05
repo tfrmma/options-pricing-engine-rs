@@ -305,11 +305,14 @@ fn draw_rbergomi_path<R: Rng>(rng: &mut R, n_steps: usize) -> RbergomiDraws {
     RbergomiDraws { z0, z1, z2, zperp }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_rbergomi_path(
-    spot: f64, drift0: f64, v: &[f64], dz: &[f64], dt: f64,
-    payoff: &Payoff, rate: f64, expiry: f64,
-) -> f64 {
+// the underlying path itself doesn't depend on strike, only payoff.eval
+// does. split out so batch_rough_bergomi below can simulate once per
+// path and evaluate every strike in a chain against the same terminal/
+// running_sum/running_max instead of rerunning this whole O(n_steps) loop
+// once per strike.
+struct RbergomiPathSummary { terminal: f64, running_sum: f64, running_max: f64 }
+
+fn simulate_rbergomi_price_path(spot: f64, drift0: f64, v: &[f64], dz: &[f64], dt: f64) -> RbergomiPathSummary {
     let mut ln_s = spot.ln();
     let mut running_sum = 0.0;
     let mut running_max = spot;
@@ -322,9 +325,17 @@ fn run_rbergomi_path(
         running_max = running_max.max(s);
     }
 
-    let terminal = ln_s.exp();
+    RbergomiPathSummary { terminal: ln_s.exp(), running_sum, running_max }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_rbergomi_path(
+    spot: f64, drift0: f64, v: &[f64], dz: &[f64], dt: f64,
+    payoff: &Payoff, rate: f64, expiry: f64,
+) -> f64 {
+    let p = simulate_rbergomi_price_path(spot, drift0, v, dz, dt);
     let disc = (-rate * expiry).exp();
-    disc * payoff.eval(terminal, running_sum, running_max, v.len())
+    disc * payoff.eval(p.terminal, p.running_sum, p.running_max, v.len())
 }
 
 // no jump term, rBergomi doesn't have one in the paper's formulation and
@@ -398,6 +409,112 @@ pub fn mc_rough_bergomi(
     let std_error = (var / n_f).sqrt();
 
     McResult { price: mean, std_error }
+}
+
+// prices a whole strike chain (same spot/expiry/rate/div_yield/params/
+// curve, the realistic case: one expiry, many strikes) against ONE
+// simulated batch of paths instead of one independent mc_rough_bergomi
+// call per strike. two things get shared that mc_rough_bergomi rebuilds
+// per call: the setup (Sigma/Cholesky/FFT plan/Gamma, already the
+// expensive part, see mc_rough_bergomi's own comment on why those are
+// built once there) AND the price path itself, which doesn't depend on
+// strike at all, only payoff.eval does. calling mc_rough_bergomi N times
+// for N strikes would redo an O(n_steps) Euler loop N times over for
+// what's physically the same underlying path each time, not just redo
+// the setup.
+//
+// only European strikes, not the general Payoff enum: Asian/UpAndOut
+// depend on the whole path (running_sum/running_max), which this already
+// computes once per replication regardless, batching those the same way
+// is a smaller, separate win (they'd share simulate_rbergomi_price_path's
+// output same as European does here) and isn't implemented yet, this
+// covers the strike-chain case, which is what a market maker actually
+// needs a batch call for.
+//
+// exact-match tested against mc_rough_bergomi with the same cfg/seed for
+// a single-strike chain: same RNG draws consumed regardless of how many
+// strikes are being evaluated against them, since the path simulation
+// never looks at strike, so a 1-element chain has to reproduce the
+// scalar call bit for bit, not just agree within MC noise.
+#[allow(clippy::too_many_arguments)]
+pub fn batch_rough_bergomi(
+    spot: f64, expiry: f64, rate: f64, div_yield: f64,
+    params: &RoughBergomiParams, curve: &ForwardVarianceCurve,
+    strikes_and_types: &[(f64, OptionType)], cfg: &McConfig,
+) -> Vec<McResult> {
+    let dt = expiry / cfg.n_steps as f64;
+    let n  = 1.0 / dt;
+    let alpha = params.alpha();
+    let drift0 = rate - div_yield;
+    let n_strikes = strikes_and_types.len();
+
+    let sigma = crate::rbergomi::hybrid_scheme_covariance(alpha, 2, n);
+    let l = crate::rbergomi::cholesky_lower(&sigma, 3).unwrap_or_else(|| {
+        panic!("hybrid scheme Sigma not positive definite for alpha={alpha}, hurst should be in (0, 0.5)")
+    });
+    let plan  = crate::rbergomi::build_conv_plan(cfg.n_steps);
+    let gamma = crate::rbergomi::build_gamma(alpha, cfg.n_steps, n);
+
+    let n_threads = rayon::current_num_threads().max(1);
+    let paths_per_pair = if cfg.antithetic { 2 } else { 1 };
+    let n_pairs_total = cfg.n_paths / paths_per_pair;
+    let chunk_size = (n_pairs_total / n_threads).max(1);
+    let disc = (-rate * expiry).exp();
+
+    let accum: (Vec<f64>, Vec<f64>, usize) = (0..n_threads)
+        .into_par_iter()
+        .map(|chunk_idx| {
+            let start = chunk_idx * chunk_size;
+            let end   = if chunk_idx == n_threads - 1 { n_pairs_total } else { (start + chunk_size).min(n_pairs_total) };
+            let mut local_sum = vec![0.0; n_strikes];
+            let mut local_sum_sq = vec![0.0; n_strikes];
+            let mut local_count = 0usize;
+            if start >= end { return (local_sum, local_sum_sq, local_count); }
+
+            let mut rng = SmallRng::seed_from_u64(splitmix64(cfg.seed ^ chunk_idx as u64));
+
+            let mut accumulate = |p: &RbergomiPathSummary| {
+                for (i, &(strike, opt_type)) in strikes_and_types.iter().enumerate() {
+                    let payoff_val = disc * intrinsic(p.terminal, strike, opt_type);
+                    local_sum[i] += payoff_val;
+                    local_sum_sq[i] += payoff_val * payoff_val;
+                }
+            };
+
+            for _ in start..end {
+                let draws = draw_rbergomi_path(&mut rng, cfg.n_steps);
+
+                let (v, dz) = crate::rbergomi::simulate_variance_and_dz(
+                    params, curve, dt, &l, &plan, &gamma,
+                    &draws.z0, &draws.z1, &draws.z2, &draws.zperp, 1.0);
+                accumulate(&simulate_rbergomi_price_path(spot, drift0, &v, &dz, dt));
+                local_count += 1;
+
+                if cfg.antithetic {
+                    let (v2, dz2) = crate::rbergomi::simulate_variance_and_dz(
+                        params, curve, dt, &l, &plan, &gamma,
+                        &draws.z0, &draws.z1, &draws.z2, &draws.zperp, -1.0);
+                    accumulate(&simulate_rbergomi_price_path(spot, drift0, &v2, &dz2, dt));
+                    local_count += 1;
+                }
+            }
+            (local_sum, local_sum_sq, local_count)
+        })
+        .reduce(
+            || (vec![0.0; n_strikes], vec![0.0; n_strikes], 0usize),
+            |mut a, b| {
+                for i in 0..n_strikes { a.0[i] += b.0[i]; a.1[i] += b.1[i]; }
+                (a.0, a.1, a.2 + b.2)
+            },
+        );
+
+    let (sum, sum_sq, count) = accum;
+    let n_f = count as f64;
+    (0..n_strikes).map(|i| {
+        let mean = sum[i] / n_f;
+        let var = (sum_sq[i] / n_f - mean * mean).max(0.0);
+        McResult { price: mean, std_error: (var / n_f).sqrt() }
+    }).collect()
 }
 
 // Andersen (2008) quadratic-exponential step for the CIR variance process.
@@ -845,5 +962,79 @@ mod tests {
         let combined_se = (rb.std_error.powi(2) + heston.std_error.powi(2)).sqrt();
         let z = (rb.price - heston.price).abs() / combined_se;
         assert!(z < 4.0, "rbergomi={:.4} heston={:.4} se={combined_se:.4} z={z:.2}", rb.price, heston.price);
+    }
+
+    // same RNG draws get consumed regardless of chain length, the path
+    // simulation never looks at strike, so a single-strike batch call has
+    // to reproduce the scalar call bit for bit, not just agree within MC
+    // noise. this is the test that actually exercises whether the shared
+    // setup + shared path refactor preserved the exact same computation,
+    // not a fresh, independently-plausible one.
+    #[test]
+    fn batch_rbergomi_single_strike_matches_scalar_exactly() {
+        let params = RoughBergomiParams { eta: 1.9, rho: -0.9, hurst: 0.07 };
+        let curve = ForwardVarianceCurve::new(vec![1.0], vec![0.09]);
+        let (s, k, t, r, q) = (100.0, 100.0, 1.0, 0.05, 0.0);
+        let cfg = rbergomi_small_cfg();
+
+        let scalar = mc_rough_bergomi(s, t, r, q, &params, &curve,
+            Payoff::European { strike: k, opt_type: OptionType::Call }, &cfg);
+        let batch = batch_rough_bergomi(s, t, r, q, &params, &curve, &[(k, OptionType::Call)], &cfg);
+
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].price, scalar.price, "batch and scalar should be bit-identical, same RNG draws either way");
+        assert_eq!(batch[0].std_error, scalar.std_error);
+    }
+
+    // every strike in a multi-strike chain has to match its OWN
+    // independent scalar call too, same reasoning, extended to confirm
+    // the shared-path evaluation doesn't cross-contaminate strikes.
+    #[test]
+    fn batch_rbergomi_multi_strike_matches_scalar_per_strike_exactly() {
+        let params = RoughBergomiParams { eta: 1.9, rho: -0.9, hurst: 0.07 };
+        let curve = ForwardVarianceCurve::new(vec![1.0], vec![0.09]);
+        let (s, t, r, q) = (100.0, 1.0, 0.05, 0.0);
+        let cfg = rbergomi_small_cfg();
+        let strikes = [(80.0, OptionType::Call), (100.0, OptionType::Call), (120.0, OptionType::Call), (100.0, OptionType::Put)];
+
+        let batch = batch_rough_bergomi(s, t, r, q, &params, &curve, &strikes, &cfg);
+        assert_eq!(batch.len(), strikes.len());
+
+        for (i, &(strike, opt_type)) in strikes.iter().enumerate() {
+            let scalar = mc_rough_bergomi(s, t, r, q, &params, &curve, Payoff::European { strike, opt_type }, &cfg);
+            assert_eq!(batch[i].price, scalar.price, "strike {strike} {opt_type:?}: batch vs scalar mismatch");
+            assert_eq!(batch[i].std_error, scalar.std_error);
+        }
+    }
+
+    // measures, doesn't guess: batching a real-sized chain against one
+    // simulated set of paths has to be meaningfully faster than the same
+    // chain priced via independent scalar calls, that's the entire point
+    // of sharing Sigma/Cholesky/FFT plan/Gamma and the price path across
+    // strikes. #ignore'd like the other timing benchmarks in this repo,
+    // this measures wall clock, not correctness.
+    #[test]
+    #[ignore]
+    fn batch_rbergomi_is_faster_than_looping_scalar_calls() {
+        use std::time::Instant;
+        let params = RoughBergomiParams { eta: 1.9, rho: -0.9, hurst: 0.07 };
+        let curve = ForwardVarianceCurve::new(vec![1.0], vec![0.09]);
+        let (s, t, r, q) = (100.0, 1.0, 0.05, 0.0);
+        let cfg = McConfig { n_paths: 100_000, n_steps: 64, seed: 1, antithetic: true, scheme: VarianceScheme::FullTruncationEuler };
+        let strikes: Vec<(f64, OptionType)> = (0..15).map(|i| (70.0 + i as f64 * 5.0, OptionType::Call)).collect();
+
+        let t0 = Instant::now();
+        let _batch = batch_rough_bergomi(s, t, r, q, &params, &curve, &strikes, &cfg);
+        let batch_time = t0.elapsed();
+
+        let t1 = Instant::now();
+        for &(strike, opt_type) in &strikes {
+            let _ = mc_rough_bergomi(s, t, r, q, &params, &curve, Payoff::European { strike, opt_type }, &cfg);
+        }
+        let loop_time = t1.elapsed();
+
+        eprintln!("batch: {batch_time:?}, looped scalar ({} strikes): {loop_time:?}, speedup: {:.1}x",
+            strikes.len(), loop_time.as_secs_f64() / batch_time.as_secs_f64());
+        assert!(batch_time < loop_time, "batch ({batch_time:?}) should beat looping scalar calls ({loop_time:?})");
     }
 }
