@@ -766,4 +766,84 @@ mod tests {
         let z = (mc.price - bs).abs() / mc.std_error;
         assert!(z < 4.0, "bs={bs:.4} mc={:.4} se={:.4} z={z:.2}", mc.price, mc.std_error);
     }
+
+    // Asian/UpAndOut share run_rbergomi_path's running_sum/running_max
+    // accumulation with European (which ignores both), but that sharing
+    // was never actually checked, a bug in either one would sit invisible
+    // behind passing European tests forever. same pathwise inequality as
+    // the Heston/Bates versions above (real inequality, not a vibe check),
+    // ported to rBergomi specifically.
+    #[test]
+    fn rbergomi_asian_cheaper_than_european() {
+        let params = RoughBergomiParams { eta: 1.9, rho: -0.9, hurst: 0.07 };
+        let curve = ForwardVarianceCurve::new(vec![1.0], vec![0.09]);
+        let (s, k, t, r, q) = (100.0, 100.0, 1.0, 0.05, 0.0);
+
+        let euro = mc_rough_bergomi(s, t, r, q, &params, &curve,
+            Payoff::European { strike: k, opt_type: OptionType::Call }, &rbergomi_small_cfg());
+        let asian = mc_rough_bergomi(s, t, r, q, &params, &curve,
+            Payoff::AsianArithmetic { strike: k, opt_type: OptionType::Call }, &rbergomi_small_cfg());
+
+        assert!(asian.price < euro.price, "asian={:.4} european={:.4}", asian.price, euro.price);
+    }
+
+    #[test]
+    fn rbergomi_up_and_out_cheaper_than_vanilla() {
+        let params = RoughBergomiParams { eta: 1.9, rho: -0.9, hurst: 0.07 };
+        let curve = ForwardVarianceCurve::new(vec![1.0], vec![0.09]);
+        let (s, k, t, r, q) = (100.0, 100.0, 1.0, 0.05, 0.0);
+
+        let vanilla = mc_rough_bergomi(s, t, r, q, &params, &curve,
+            Payoff::European { strike: k, opt_type: OptionType::Call }, &rbergomi_small_cfg());
+        let uao = mc_rough_bergomi(s, t, r, q, &params, &curve,
+            Payoff::UpAndOut { strike: k, barrier: 130.0, rebate: 0.0, opt_type: OptionType::Call }, &rbergomi_small_cfg());
+
+        assert!(uao.price < vanilla.price, "uao={:.4} vanilla={:.4}", uao.price, vanilla.price);
+        assert!(uao.price >= 0.0);
+    }
+
+    // stronger than the pathwise inequalities above: two INDEPENDENTLY
+    // implemented path accumulators (Heston's simple SDE loop, rBergomi's
+    // hybrid-scheme+FFT variance path feeding the same Euler update) have
+    // to land on the same VALUE, not just the same ordering, when their
+    // stochastic-vol content is switched off. this is what actually
+    // exercises run_rbergomi_path's running_sum/running_max, not just
+    // whether Asian < European.
+    #[test]
+    fn rbergomi_asian_matches_heston_when_vol_of_vol_is_tiny() {
+        let (s, k, t, r, q) = (100.0, 100.0, 1.0, 0.05, 0.0);
+        let cfg = McConfig { n_paths: 100_000, n_steps: 64, seed: 11, antithetic: true, scheme: VarianceScheme::FullTruncationEuler };
+
+        let rb_params = RoughBergomiParams { eta: 0.001, rho: -0.9, hurst: 0.07 };
+        let curve = ForwardVarianceCurve::new(vec![2.0], vec![0.04]);
+        let rb = mc_rough_bergomi(s, t, r, q, &rb_params, &curve,
+            Payoff::AsianArithmetic { strike: k, opt_type: OptionType::Call }, &cfg);
+
+        let heston_params = HestonParams { v0: 0.04, kappa: 2.0, theta: 0.04, sigma: 0.001, rho: -0.5 };
+        let heston = mc_heston(s, t, r, q, &heston_params,
+            Payoff::AsianArithmetic { strike: k, opt_type: OptionType::Call }, &cfg);
+
+        let combined_se = (rb.std_error.powi(2) + heston.std_error.powi(2)).sqrt();
+        let z = (rb.price - heston.price).abs() / combined_se;
+        assert!(z < 4.0, "rbergomi={:.4} heston={:.4} se={combined_se:.4} z={z:.2}", rb.price, heston.price);
+    }
+
+    #[test]
+    fn rbergomi_up_and_out_matches_heston_when_vol_of_vol_is_tiny() {
+        let (s, k, t, r, q) = (100.0, 100.0, 1.0, 0.05, 0.0);
+        let cfg = McConfig { n_paths: 100_000, n_steps: 64, seed: 13, antithetic: true, scheme: VarianceScheme::FullTruncationEuler };
+
+        let rb_params = RoughBergomiParams { eta: 0.001, rho: -0.9, hurst: 0.07 };
+        let curve = ForwardVarianceCurve::new(vec![2.0], vec![0.04]);
+        let rb = mc_rough_bergomi(s, t, r, q, &rb_params, &curve,
+            Payoff::UpAndOut { strike: k, barrier: 130.0, rebate: 0.0, opt_type: OptionType::Call }, &cfg);
+
+        let heston_params = HestonParams { v0: 0.04, kappa: 2.0, theta: 0.04, sigma: 0.001, rho: -0.5 };
+        let heston = mc_heston(s, t, r, q, &heston_params,
+            Payoff::UpAndOut { strike: k, barrier: 130.0, rebate: 0.0, opt_type: OptionType::Call }, &cfg);
+
+        let combined_se = (rb.std_error.powi(2) + heston.std_error.powi(2)).sqrt();
+        let z = (rb.price - heston.price).abs() / combined_se;
+        assert!(z < 4.0, "rbergomi={:.4} heston={:.4} se={combined_se:.4} z={z:.2}", rb.price, heston.price);
+    }
 }
