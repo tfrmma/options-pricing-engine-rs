@@ -10,6 +10,13 @@ use crate::heston::{heston_price, heston_price_and_greeks};
 use crate::bates::{bates_price, bates_price_and_greeks};
 use crate::iv::implied_vol;
 
+// lives in mc.rs, not defined here like the others: it needs mc.rs's
+// private RNG/path-simulation internals (shares the underlying price
+// path across every strike in the chain instead of resimulating per
+// strike, see its own doc comment), re-exported here so "batch pricing"
+// is one place to look regardless of which model.
+pub use crate::mc::batch_rough_bergomi;
+
 pub fn batch_bsm(contracts: &[OptionContract]) -> Vec<PricingResult> {
     contracts.par_iter().map(bsm_price_and_greeks).collect()
 }
