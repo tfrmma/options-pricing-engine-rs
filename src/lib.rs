@@ -19,9 +19,10 @@ pub mod deribit_inverse;
 // flatten the hot path to crate root
 pub use types::{OptionType, OptionContract, PricingResult, IvProblem,
                 HestonParams, BatesParams, LocalVolSurface,
-                RoughBergomiParams, ForwardVarianceCurve};
+                RoughBergomiParams, ForwardVarianceCurve,
+                InverseContract, CoinIvProblem};
 pub use rbergomi::{bootstrap_forward_variance_curve, CurveBootstrapError};
-pub use deribit_inverse::{InverseGreeks, mc_result_to_coin, implied_vol_coin, CoinIvProblem};
+pub use deribit_inverse::{InverseGreeks, mc_result_to_coin, implied_vol_coin};
 pub use bsm::{bsm_price, bsm_price_and_greeks, black76_price_and_greeks};
 pub use iv::implied_vol;
 pub use heston::{heston_price, heston_price_and_greeks};
@@ -29,7 +30,7 @@ pub use ad::{heston_greeks_ad, heston_greeks_ad5, bates_greeks_ad, bates_jump_se
 pub use bates::{bates_price, bates_price_and_greeks};
 pub use local_vol::{dupire_local_vol, monotone_cubic_interp, check_and_repair_surface,
                      repair_surface_to_clean, SurfaceAudit, SurfaceViolation, ViolationKind};
-pub use mc::{mc_heston, mc_bates, McConfig, McResult, Payoff, VarianceScheme};
+pub use mc::{mc_heston, mc_bates, mc_rough_bergomi, McConfig, McResult, Payoff, VarianceScheme};
 pub use calibration::{calibrate_heston, calibrate_bates,
                        calibrate_heston_multistart, calibrate_bates_multistart,
                        calibrate_heston_global, calibrate_bates_global,
@@ -37,4 +38,5 @@ pub use calibration::{calibrate_heston, calibrate_bates,
                        calibrate_heston_global_regularized, calibrate_bates_global_regularized,
                        CalibInput, CalibResult, MultistartResult, GlobalCalibResult};
 pub use batch::{batch_bsm, batch_bsm_price, batch_heston, batch_heston_greeks,
-                batch_bates, batch_bates_greeks, batch_implied_vol};
+                batch_bates, batch_bates_greeks, batch_implied_vol, batch_rough_bergomi,
+                batch_price_coin, batch_greeks_coin, batch_implied_vol_coin};
