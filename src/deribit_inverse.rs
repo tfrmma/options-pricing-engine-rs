@@ -37,7 +37,7 @@
 
 use crate::math::{ncdf, npdf};
 use crate::mc::McResult;
-use crate::types::OptionType;
+use crate::types::{OptionType, CoinIvProblem};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct InverseGreeks {
@@ -115,14 +115,8 @@ pub fn greeks(opt_type: OptionType, forward: f64, strike: f64, vol: f64, t: f64)
 // bisection-fallback architecture as iv.rs, forward-based instead of
 // spot/rate/div_yield since that's what a coin-settled quote actually
 // gives you (Deribit quotes premium in coin against the mark price of
-// the corresponding future, not against spot).
-pub struct CoinIvProblem {
-    pub forward: f64,
-    pub strike: f64,
-    pub expiry: f64,
-    pub opt_type: OptionType,
-    pub market_price_coin: f64,
-}
+// the corresponding future, not against spot). CoinIvProblem itself
+// lives in types.rs, same pairing as IvProblem/OptionContract there.
 
 const MAX_ITER: usize = 10;
 const TOL: f64 = 1e-10;
