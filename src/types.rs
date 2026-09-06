@@ -44,6 +44,31 @@ pub struct IvProblem {
     pub market_price: f64,
 }
 
+// forward-based, not spot/rate/div_yield: deribit_inverse's Greeks are
+// computed against the tradable future/perp mark price directly, the
+// same way a trader actually quotes and hedges these, doesn't fit
+// OptionContract's shape.
+#[derive(Debug, Clone, Copy)]
+pub struct InverseContract {
+    pub forward:   f64,
+    pub strike:    f64,
+    pub expiry:    f64,
+    pub opt_type:  OptionType,
+    pub vol:       f64,
+}
+
+// same pairing as IvProblem/OptionContract above, coin-denominated instead
+// of USD. lived in deribit_inverse.rs at first, moved here for the same
+// reason IvProblem lives with OptionContract instead of in iv.rs.
+#[derive(Debug, Clone, Copy)]
+pub struct CoinIvProblem {
+    pub forward:            f64,
+    pub strike:             f64,
+    pub expiry:             f64,
+    pub opt_type:           OptionType,
+    pub market_price_coin:  f64,
+}
+
 // NOTE: v0 is variance, not vol. vol = sqrt(v0). burned by this once.
 #[derive(Debug, Clone, Copy)]
 pub struct HestonParams {
