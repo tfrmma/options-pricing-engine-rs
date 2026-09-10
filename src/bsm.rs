@@ -48,7 +48,9 @@ fn theta_calc(
     vsqt: f64, t: f64, phi: f64,
 ) -> f64 {
     // per year, caller divides by 365 if they want daily
-    -seq*npd1*vsqt/(2.0*t) - phi*(q*seq*nd1 - r*ker*nd2)
+    // carry terms: +q*S*e^{-qT}*N(phi*d1) - r*K*e^{-rT}*N(phi*d2) for a call,
+    // sign flips for a put via phi. previous version had both flipped.
+    -seq*npd1*vsqt/(2.0*t) + phi*(q*seq*nd1 - r*ker*nd2)
 }
 
 #[inline]
@@ -77,7 +79,10 @@ pub fn black76_price_and_greeks(
     let delta = phi * er * nd1;
     let gamma = er * npd1 / (fwd * vt);
     let vega  = fwd * er * npd1 * expiry.sqrt();
-    let theta = er * (-fwd*npd1*vol/(2.0*expiry.sqrt()) - phi*rate*(fwd*nd1 - strike*nd2));
+    // theta = r*Price - er*fwd*N'(d1)*vol/(2*sqrt(T)), derived via
+    // fwd*N'(d1) = strike*N'(d2). previous version had the rate term flipped,
+    // same class of bug as BSM's carry sign.
+    let theta = er * (-fwd*npd1*vol/(2.0*expiry.sqrt()) + phi*rate*(fwd*nd1 - strike*nd2));
     // fwd is exogenous here, not spot*e^{(r-q)T}, so the only r-dependence in price
     // is the discount factor out front. rho = d(price)/dr = -T*price. the old
     // phi*strike*expiry*er*nd2 was BSM's rho pasted in, it's missing the fwd*nd1 term.
