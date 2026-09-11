@@ -28,11 +28,21 @@ pub fn dupire_local_vol(
     let d2w_dk2 = d2var_dk2(surf, i_k, j_t);
     let x       = (spot/k).ln() + (rate - div_yield)*t; // log-moneyness
 
-    // Dupire in total variance form
+    // Dupire in total variance form (Gatheral). the standard formula is stated
+    // in terms of derivatives w.r.t. log-moneyness y = ln(K/F), not raw strike
+    // K. dw_dk/d2w_dk2 above are raw d/dK, d2/dK2 (computed off surf.strikes,
+    // which are actual strike prices, not log-moneyness) so they need the
+    // K, K^2 Jacobian factors from y=ln(K/F) => dK/dy=K before they can be used
+    // in the y-parametrized formula. previous version plugged them in directly
+    // with no K factors at all, silently wrong on any curved (non-flat) smile,
+    // exact on a flat surface only, since dw_dk=d2w_dk2=0 there.
+    // full derivation: w_y = K*dw_dk, w_yy = K*dw_dk + K^2*d2w_dk2,
+    // y = -x. verified against the y-form symbolically (sympy) before landing.
+    let ka  = k * dw_dk;
+    let k2b = k*k*d2w_dk2;
     let num   = dw_dt;
-    let denom = 1.0 - (x/w)*dw_dk
-              + 0.25*(-0.25 - 1.0/w + x*x/(w*w))*dw_dk*dw_dk
-              + 0.5*d2w_dk2;
+    let denom = 1.0 + ka*(0.5 + x/w) + 0.5*k2b
+              + 0.25*ka*ka*(x*x/(w*w) - 1.0/w - 0.25);
 
     if denom <= 1e-10 || num <= 0.0 { return 0.0; }
     (num / denom).max(0.0).sqrt()
