@@ -4,6 +4,7 @@ use options_pricing_engine::{LocalVolSurface, dupire_local_vol, monotone_cubic_i
 // differentiating directly w.r.t. log-moneyness x (not raw strike K),
 // using the crate's own monotone_cubic_interp so both paths share the
 // same interpolant and only the differentiation variable differs.
+#[allow(clippy::too_many_arguments)]
 fn reference_local_vol(
     strikes: &[f64], expiries: &[f64], local_vols: &[f64],
     spot: f64, rate: f64, div_yield: f64,
